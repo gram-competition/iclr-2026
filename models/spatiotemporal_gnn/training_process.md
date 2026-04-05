@@ -477,18 +477,48 @@ Best checkpoint was selected by the lowest validation L2 (mean pointwise L2 velo
   model's best L2 of 1.1525 represents a ~90% reduction from the persistence
   baseline.
 
-### Per-Stage Inference Timing (GPU, cuda:2)
+### Inference Speed
 
-Measured on the first few batches during training:
+**GPU is highly recommended for inference.** The model uses local multi-head
+attention over 100k nodes with k=24 neighbors across 10 transformer layers,
+which benefits heavily from GPU parallelism.
 
-| Stage    | Time (ms) | Description                           |
-|----------|-----------|---------------------------------------|
-| Graph    | 70-80     | k-NN construction via cKDTree on CPU  |
-| Encode   | 1-3       | Fourier PE + node encoder MLP         |
-| Spatial  | 452-460   | 10 Graph Transformer layers           |
-| Temporal | 65-73     | 2-layer temporal attention head       |
-| Decode   | 3         | Decoder MLP + residual                |
-| **Total**| **~600**  | **Per-sample forward pass**           |
+**Benchmark hardware:** Timings below are from NVIDIA GPUs accessed via CUDA.
+Training used **`cuda:2`** (log reported **~46.6 GiB** total GPU memory on that
+device). The **95-sample evaluation** and per-stage breakdown used **`cuda:1`**
+in `main.py` on the same workstation. The exact SKU (e.g. A6000 vs A100) was
+not written to logs; run `nvidia-smi -L` or
+`python -c "import torch; print(torch.cuda.get_device_name(1))"` on your
+machine to see the model name for the active CUDA index.
+
+| Device             | Time per sample | 95 samples  | Notes                              |
+|--------------------|-----------------|-------------|------------------------------------|
+| **GPU (NVIDIA)**   | **~0.95s**      | **~90s**    | Recommended; see benchmark hardware above. |
+| CPU                | ~28s            | ~45 min     | Functional but ~30x slower.        |
+
+### Per-Stage Timing Breakdown (GPU)
+
+Measured per sample on GPU inference (100k points, k=24):
+
+| Stage    | Time (ms) | % of Total | Description                           |
+|----------|-----------|------------|---------------------------------------|
+| Graph    | 70-80     | 12%        | k-NN construction via cKDTree on CPU  |
+| Encode   | 1-3       | <1%        | Fourier PE + node encoder MLP         |
+| Spatial  | 452-460   | 75%        | 10 Graph Transformer layers           |
+| Temporal | 65-73     | 11%        | 2-layer temporal attention head       |
+| Decode   | 3         | <1%        | Decoder MLP + residual                |
+| **Total**| **~600**  | **100%**   | **Per-sample forward pass**           |
 
 The spatial backbone dominates inference time (~75%), as expected for a
 10-layer Graph Transformer operating on 100k nodes with k=24 neighbors.
+The k-NN graph construction runs on CPU (via scipy.cKDTree) regardless of
+device, accounting for ~12% of the total time.
+
+### Evaluation Metric on 95 Test Samples (GPU)
+
+```
+Metric: 1.1978 +- 0.4819
+```
+
+Evaluated on 95 randomly selected samples from the dataset using GPU inference.
+Total inference time: 90.8 seconds (0.96s/sample).
