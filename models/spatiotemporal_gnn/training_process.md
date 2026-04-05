@@ -314,37 +314,6 @@ network predicts.
 
 ### Command
 
-```bash
-python train.py \
-  --data_dir ../warped_ifw \
-  --backbone graph_transformer \
-  --hidden_dim 256 \
-  --num_layers 10 \
-  --heads 8 \
-  --k 24 \
-  --num_sub 100000 \
-  --use_fourier \
-  --interp_k 5 \
-  --dropout 0.05 \
-  --lambda_grad 0.5 \
-  --alpha 1.0 \
-  --beta 0.1 \
-  --gamma 0.5 \
-  --delta_loss 0.2 \
-  --airfoil_weight 5.0 \
-  --epochs 50 \
-  --batch_size 1 \
-  --lr 2e-4 \
-  --weight_decay 1e-4 \
-  --warmup_epochs 10 \
-  --scheduler cosine \
-  --grad_clip 1.0 \
-  --device cuda:2 \
-  --save_dir checkpoints_gt_best \
-  --log_dir runs_gt_best \
-  --save_every 25
-```
-
 ### Dataset
 
 - **Source**: warped_ifw (GRaM competition dataset)
