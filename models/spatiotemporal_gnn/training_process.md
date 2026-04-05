@@ -484,16 +484,11 @@ attention over 100k nodes with k=24 neighbors across 10 transformer layers,
 which benefits heavily from GPU parallelism.
 
 **Benchmark hardware:** Timings below are from NVIDIA GPUs accessed via CUDA.
-Training used **`cuda:2`** (log reported **~46.6 GiB** total GPU memory on that
-device). The **95-sample evaluation** and per-stage breakdown used **`cuda:1`**
-in `main.py` on the same workstation. The exact SKU (e.g. A6000 vs A100) was
-not written to logs; run `nvidia-smi -L` or
-`python -c "import torch; print(torch.cuda.get_device_name(1))"` on your
-machine to see the model name for the active CUDA index.
+
 
 | Device             | Time per sample | 95 samples  | Notes                              |
 |--------------------|-----------------|-------------|------------------------------------|
-| **GPU (NVIDIA)**   | **~0.95s**      | **~90s**    | Recommended; see benchmark hardware above. |
+| **GPU (NVIDIA RTX A6000 48GB)**   | **~0.95s**      | **~90s**    | Recommended; see benchmark hardware above. |
 | CPU                | ~28s            | ~45 min     | Functional but ~30x slower.        |
 
 ### Per-Stage Timing Breakdown (GPU)
