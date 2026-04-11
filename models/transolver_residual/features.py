@@ -1,33 +1,22 @@
 """
 Per-point feature computation for TransolverResidual.
 
-Distance features (dist_to_airfoil, upstream_dist) depend only on pos and
-idcs_airfoil, which are fixed per simulation (shared across all time windows).
-They are precomputed once in the Dataset and passed into compute_features,
-so the expensive nearest-surface search never runs during training.
-
-Optional extra features (controlled by flags in compute_features):
-    use_temporal_deltas : velocity differences Δv_t = v_t - v_{t-1} for t=1..4
-                          Encodes the arrow of time and local acceleration.
-                          Adds 12 channels (4 timesteps × 3 components).
-    use_local_feats     : mean velocity of the k=8 nearest spatial neighbours.
-                          Gives each point awareness of its local flow context.
-                          Adds 15 channels (5 timesteps × 3 components).
-                          Requires knn_feats (precomputed k-NN indices) to be
-                          passed in; falls back to zeros if not available.
-
 Base feature vector (52 channels):
-    pos_normalized   ( 3)  — position in [0,1]^3  (per-sample bounding box)
-    velocity_in      (15)  — 5 input snapshots flattened (5 × 3)
-    poly_residual    (15)  — velocity_in minus polynomial fit on input window
-    temporal_mean    ( 3)  — mean velocity over 5 input timesteps per component
-    temporal_std     ( 3)  — std  velocity over 5 input timesteps per component
-    is_airfoil       ( 1)  — 1 if point is on airfoil surface, 0 otherwise
-    dist_to_airfoil  ( 1)  — distance to nearest airfoil surface point
-    upstream_dist    ( 1)  — signed x-offset to nearest surface point
+    pos_normalized   ( 3)  -- position in [0,1]^3  (per-sample bounding box)
+    velocity_in      (15)  -- 5 input snapshots flattened (5 × 3)
+    poly_residual    (15)  -- velocity_in minus polynomial fit on input window
+    temporal_mean    ( 3)  -- mean velocity over 5 input timesteps per component
+    temporal_std     ( 3)  -- std  velocity over 5 input timesteps per component
+    is_airfoil       ( 1)  -- 1 if point is on airfoil surface, 0 otherwise
+    dist_to_airfoil  ( 1)  -- distance to nearest airfoil surface point
+    upstream_dist    ( 1)  -- signed x-offset to nearest surface point
                              (positive = downstream, negative = upstream)
-    t_values         (10)  — all 10 time values broadcast to every point
+    t_values         (10)  -- all 10 time values broadcast to every point
                              (global temporal context)
+    velocity_differences (12) -- Δv_t = v_t - v_{t-1} for t=1..4
+                          
+    local_features   (15)  -- mean velocity of the k=8 nearest spatial neighbours.
+                          
 """
 
 import torch
@@ -69,9 +58,9 @@ def precompute_distance_features(
         idcs_airfoil : (K,)    int64  numpy array
 
     Returns:
-        is_airfoil      : (N,)  float32 — binary surface flag
-        dist_to_airfoil : (N,)  float32 — Euclidean distance to nearest surface pt
-        upstream_dist   : (N,)  float32 — signed x-offset to nearest surface pt
+        is_airfoil      : (N,)  float32 -- binary surface flag
+        dist_to_airfoil : (N,)  float32 -- Euclidean distance to nearest surface pt
+        upstream_dist   : (N,)  float32 -- signed x-offset to nearest surface pt
     """
     N = len(pos)
     is_airfoil_arr      = np.zeros(N, dtype=np.float32)
@@ -111,7 +100,7 @@ def precompute_knn(pos: np.ndarray, k: int = KNN_K) -> np.ndarray:
         k   : number of neighbours (default KNN_K=8)
 
     Returns:
-        knn_idx : (N, k)  int32 — indices of k nearest neighbours per point
+        knn_idx : (N, k)  int32 -- indices of k nearest neighbours per point
     """
     from scipy.spatial import cKDTree
     tree = cKDTree(pos)
@@ -140,7 +129,7 @@ def compute_features(
         t                    : (B, 10)
         poly_degree          : degree used for polynomial fit residual
         dist_feats           : optional list of B tuples
-                               (is_airfoil, dist_to_airfoil, upstream_dist) — each (N,)
+                               (is_airfoil, dist_to_airfoil, upstream_dist) -- each (N,)
                                If provided, skips the nearest-surface computation.
         use_local_feats      : if True, append mean neighbour velocity (15 ch)
         use_temporal_deltas  : if True, append velocity differences (12 ch)
@@ -183,7 +172,7 @@ def compute_features(
             dist_to_airfoil[b, :, 0] = dist.to(device=device, dtype=dtype)
             upstream_dist[b, :, 0]   = xsign.to(device=device, dtype=dtype)
     else:
-        # Fallback: compute on-the-fly (slow — avoid during training)
+        # Fallback: compute on-the-fly (slow -- avoid during training)
         for b in range(B):
             idcs = idcs_airfoil[b].to(device)
             is_airfoil[b, idcs, 0] = 1.0

@@ -1,15 +1,6 @@
-# Competition track of the GRaM workshop
-
-[![](https://img.shields.io/badge/Website-GRaM_workshop-white)](https://gram-workshop.github.io)
-[![](https://img.shields.io/badge/Website-GRaM_competition-teal)](https://gram-competition.github.io)
-[![](https://img.shields.io/badge/Hugging_Face-Dataset-yellow)](https://huggingface.co/datasets/gram-competition/warped-ifw)
-
-<img src=".logos/beyondmath.svg" height="60vw">&nbsp;&nbsp;&nbsp;<img src=".logos/mcml.svg" height="60vw">
-
-This repository functions as submission portal for the competition hosted in conjunction with the Workshop on Geometry-grounded Representation Learning and Generative Modeling (GRaM) at ICLR 2026.
-For description of the challenge refer to the competition website (link above).
-
-Deadline is on **April 22, 2026 (AoE)**.
+#
+This repo contains our submission to the Geometry-grounded Representation Learning and Generative Modeling (GRaM) competition at ICLR 2026.
+For description of the challenge refer to the competition website .
 
 ## Submission guidelines
 

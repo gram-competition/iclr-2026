@@ -1,25 +1,3 @@
-"""
-TransolverResidual — full model for GRaM transient airflow prediction.
-
-Forward pass:
-    1. Polynomial extrapolation (no learned params) → baseline prediction
-    2. Per-point feature computation (52–79 channels depending on flags)
-    3. Per-point MLP encoder: D → hidden_dim
-    4. L × Transolver blocks (Physics-Attention on irregular 3-D mesh)
-    5. Per-point MLP decoder: hidden_dim → 15  (5 timesteps × 3 components)
-    6. Output = poly_baseline + learned_correction
-    7. Hard zero on airfoil surface (no-slip enforcement)
-
-Optional feature flags (must match between training and inference):
-    use_local_feats     : add mean velocity of 8 nearest neighbours (+15 ch)
-    use_temporal_deltas : add velocity differences Δv_t = v_t - v_{t-1} (+12 ch)
-
-The model only learns the turbulent *correction* on top of the polynomial
-baseline. This means:
-  - it degrades gracefully (poly baseline is returned even if correction≈0)
-  - the learning target is zero-mean  ← easier to optimise
-  - capacity is focused on the wake, where prediction is hardest
-"""
 
 import os
 import torch
@@ -245,8 +223,6 @@ class TransolverResidual(nn.Module):
             out[b, :, idcs_airfoil[b]] = 0.0
 
         return out
-
-    # ── Convenience ───────────────────────────────────────────────────────────
 
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)

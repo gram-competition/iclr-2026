@@ -1,151 +1,76 @@
 # TransolverResidual — GRaM 2026 Submission
 
+This is our submission for the GRaM challenge at ICLR 2026.
+
 **Task:** Predict 5 future velocity field timesteps from 5 input timesteps on irregular
 3D point clouds (~100k points) around F1-style airfoil geometries.
 
-**Approach:** Physics-Attention Transolver on top of a polynomial extrapolation baseline.
-The network learns only the turbulent *correction*; the low-frequency dynamics are
-handled analytically for free.
+## Approach:
+To be honest we were quite wary of computational-constraints, so our approach was mainly to try to circumvent those problems. Taking the time limitations into account, we wanted to leverage an architecture that is not too demanding computationally, and in the end, we settled on the architecture Transolver [1] paper, cited below. Looking back, and having in mind that this workshop was centered around "Geometry-grounded Representation Learning", we believe this was a mistake, but hey, you win some you lose some.
 
----
+It is obvious that these simulations have a very easy part (the laminar flow) and a very difficult part (the turbulent flow). So, in order to use this inductive bias somehow, we framed the model in the following way:
+First, using the first 5 snapshots, we build a polynomial of degree 2 approximation for each point, which acts as our baseline. Then, we use the Transolver to try and learn the residual. (Was this sensible? I don't really know.)
 
-## Architecture
+The Transolver architecture divides the points from the point-cloud in different slices, in theory depending on the "regime" in which they are. This is, points that are on the wake, should be on the same slice, points that are on the clean laminar flow should be on the same slice... Then, Physics Attention is applied among these slices, which gives the model some sort of global knowledge. Howeeeeever, as you can imagine, points don't get to know anything about their local neighborhood, which is NOT good. We tried to "bandaid" this by running some kNN lookup at the beginning and computing the mean velocities of the 8 closest points to each point, as a way of adding some local information, but this is very poor and quite a senseless idea.
 
-```
-velocity_in (B, 5, N, 3)
-      │
-      ├─ poly_extrapolate() ──────────────────────────────────────────► poly_baseline (B, 5, N, 3)
-      │     quadratic fit at input times, evaluated at output times
-      │
-      ├─ compute_features()
-      │     pos_normalized    ( 3)  bounding-box normalised position
-      │     velocity_in       (15)  5 input snapshots flattened
-      │     poly_residual     (15)  v_in − poly_fit(v_in) — turbulence proxy
-      │     temporal_mean     ( 3)  mean velocity over input window
-      │     temporal_std      ( 3)  std velocity over input window
-      │     is_airfoil        ( 1)  binary surface flag
-      │     dist_to_airfoil   ( 1)  distance to nearest surface point
-      │     upstream_dist     ( 1)  signed x-offset to nearest surface point
-      │     t_values          (10)  all 10 time values, broadcast to every point
-      │     local_nbr_mean    (15)  mean velocity of 8 nearest neighbours (k-NN)
-      │     temporal_deltas   (12)  Δv_t = v_t − v_{t−1} for t = 1..4
-      │     ─────────────────────
-      │     total             (79)
-      │
-      ├─ MLP encoder: 79 → 512 → 256 (GELU)
-      │
-      ├─ 8 × TransolverBlock
-      │     PhysicsAttention(dim=256, heads=8, slices=32)
-      │     FFN(dim=256, ratio=1)
-      │     LayerNorm + residual connections
-      │
-      ├─ LayerNorm + Linear: 256 → 15
-      │
-      ├─ reshape: (B, N, 15) → (B, 5, N, 3)  [correction]
-      │
-      └─ output = poly_baseline + correction
-                  zeroed at idcs_airfoil  (hard no-slip enforcement)
-```
+Another problem we face the ability to include the temporal inductive bias (spoiler, we don't have any, at least for the residual part). The polynomial part respects time in a proper way, but we couldn't find any "cheap" way of adding a sensible way of incorporating the temporal inductive bias within the Transolver (maybe we could try to frame it as a Markovian solve where we always predict a timestep starting from the previous ones, but we didn't do it). So, of course, we tried to "bandaid" it again, in this case by adding more feature engineering and adding some temporal_deltas as an input vector. Does it really make it any better? Not sure, I would be surprised it makes too big of a difference, it just adds more features.
 
-**Parameters:** 2.85M
 
----
+And last but not least, I wouldn't say our solution is too "Geometry Grounded". it's true that the physics regimes that we can find in this simulation are quite geometry agnostic, but still, we only "encode" geometry by adding to the feature vector of each point: (i) distance to the nearest surface point, (ii) signed x-offset to the nearest surface point. This is not nearly enough, we should have tried to encode this geometry more faithfully and in a more "global" manner (some message passing?).
 
-## Design Decisions
 
-### Residual Learning on a Polynomial Baseline
 
-The polynomial extrapolation (degree 2) handles low-frequency laminar dynamics.  
-The Transolver learns only the turbulent correction — the part the polynomial gets wrong.
-Benefits:
-- Zero-initialised decoder → model starts as a pure polynomial baseline; gradient descent
-  learns corrections from a stable initialisation.
-- Graceful degradation: if the correction is poor, the polynomial still provides a
-  reasonable prediction.
-- Learning target is near zero-mean, which is easier to optimise.
+Anyways, the results are not too bad (we hope), and some decent tricks were applied (the polynomial baseline, some data augmentation...). If you inspect the soft-assignment of points to the slices, you get mixed feelings, it's true that for some layers the entropy is low, which means that points were clearly divided, which is good :-)
+Some of these slices end up empty, so we know that our model has too many slices, maybe it would've been wise to analyze this in a proper way instead of putting 32 slices just for the sake of it. 
+In other slices, the entropy is super-high and we see that points were randomly and evenly distributed among slices (not good), but as we have skip connections, this is not that big of a problem.
 
-### Physics-Attention (Transolver)
+All in all:
+- Cool experience B-)
+- I hope that the people who read this can learn from our mistakes. If you find some clever ways to circumvent our problems or want to shed some light on us, it would be more than welcome.
 
-Instead of attending over all N=100k points (O(N²)), each point is soft-assigned to one
-of M=32 physics slices via a learned linear projection + softmax.  Standard self-attention
-runs only among the M slice tokens, then broadcasts back.  
-Complexity: O(N·M·C + M²·C) — linear in N.
+Big thank you to the sponsors and organizers!!!!!
 
-The slices learn to separate physical regimes (freestream, boundary layer, wake) without
-explicit supervision.
-
-### Feature Engineering
-
-- **`poly_residual`:** deviation of the input velocity from the polynomial fit — a direct,
-  explicit proxy for where turbulence is already present in the input window.
-- **`dist_to_airfoil` + `upstream_dist`:** compact geometry encoding that differentiates
-  upstream (clean flow) from downstream (wake / interference) relative to the surface.
-- **`local_nbr_mean`:** mean velocity of 8 nearest spatial neighbours.  Gives each point
-  awareness of its local flow context, compensating for the lack of explicit local
-  aggregation in the Transolver.
-- **`temporal_deltas`:** velocity differences Δv_t encode local acceleration and the
-  arrow of time.
-
-### No-Slip Boundary Condition
-
-Velocity at `idcs_airfoil` points is hard-zeroed after the final addition.  
-Exact, free, and guaranteed — the network never needs to learn to predict zeros at the
-surface.
 
 ---
 
 ## Training
 
-### Data
+**Data**
 
 - 905 samples (181 simulations × 5 time windows), all used for training.
 - 90 / 10 random train / val split.
 - Each sample: `velocity_in (5, 100k, 3)`, `pos (100k, 3)`, `idcs_airfoil`, `velocity_out (5, 100k, 3)`.
 
-### Preprocessing (offline)
+**Preprocessing**
 
 Distance features (`dist_to_airfoil`, `upstream_dist`, `is_airfoil`) and k-NN indices
 are precomputed per simulation and stored as `.distcache.npz` / `.knncache.npz` sidecar
 files to avoid recomputing them every epoch.
 
-### Loss
+**Loss**
 
-Relative L² loss on the velocity correction (predicted output vs. ground truth):
+Relative L² loss on the velocity (predicted output vs. ground truth):
 
 ```
 loss = ‖ velocity_out_pred − velocity_out_gt ‖₂ / ‖ velocity_out_gt ‖₂
 ```
 
-### Optimiser
+**Optimiser**
 
 Adam (lr=1e-3) with cosine annealing over 400 epochs.  
 Gradient accumulation over 4 steps (effective batch size 4 with batch_size=1).
 
-### Augmentation
 
-Y-axis flip: the velocity y-component and position y-coordinate are negated.
-This is the dominant augmentation — without it, the model cannot break y-symmetry
-because the training geometries are y-biased (consistent pitch orientation).
-Layer-0 slice entropy dropped from ~100% to ~10.6% after adding y-flip augmentation,
-indicating the slices transitioned from uninformative to physically meaningful routing.
+**Hardware**
 
-### Hardware
+Single NVIDIA L40S (40 GB).  Training time: ~6 hours for 400 epochs.
 
-Single NVIDIA A100 (40 GB).  Training time: ~6 hours for 400 epochs.
 
----
+**Reproduction**
 
-## Validation Results
-
-| Metric | Value |
-|--------|-------|
-| Val rel-L2 (mean over t5–t9) | 0.066 |
-| Val rel-L2 at t5 (first future step) | 0.069 |
-| Val rel-L2 at t9 (last future step) | 0.084 |
-| Polynomial baseline at t9 | 1.277 |
-
-The model achieves ~15× error reduction over the polynomial baseline at the longest
-horizon (t9), and a modest +22% error growth from t5 to t9 (vs. +514% for the polynomial).
+```
+bash runner.sh
+```
 
 ---
 
@@ -161,19 +86,7 @@ The model is fully self-contained: no external config files are required.
 
 ---
 
-## Reproduction
+## References
 
-```bash
-# 1. Precompute distance and k-NN caches
-python precompute_caches.py --data_dir ./data/gram/
+[1] Wu, H., Luo, H., Wang, H., Wang, J. &amp; Long, M.. (2024). Transolver: A Fast Transformer Solver for PDEs on General Geometries. <i>Proceedings of the 41st International Conference on Machine Learning</i>, in <i>Proceedings of Machine Learning Research</i> 235:53681-53705 Available from https://proceedings.mlr.press/v235/wu24r.html.
 
-# 2. Train
-python train.py \
-    --n_layers 8 --hidden_dim 256 --epochs 400 \
-    --lr 1e-3 --accum_steps 4 --num_workers 16 \
-    --train_fraction 1.0 --augment \
-    --use_local_feats --use_temporal_deltas \
-    --run_name run_final
-
-# 3. Best checkpoint is saved to models/transolver_residual/weights.pt
-```
