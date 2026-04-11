@@ -71,12 +71,25 @@ def _load_sample(path: str, device):
     velocity_out = torch.from_numpy(data["velocity_out"]).unsqueeze(0).to(device)  # (1,5,N,3)
     idcs_airfoil = [torch.from_numpy(data["idcs_airfoil"].astype(np.int64))]
 
-    ia, dist, xsign = precompute_distance_features(
-        data["pos"], data["idcs_airfoil"].astype(np.int64)
-    )
+    # Distance features
+    cache_path = path.replace(".npz", ".distcache.npz")
+    if os.path.exists(cache_path):
+        cache = np.load(cache_path)
+        ia, dist, xsign = cache["ia"], cache["dist"], cache["xsign"]
+    else:
+        ia, dist, xsign = precompute_distance_features(
+            data["pos"], data["idcs_airfoil"].astype(np.int64)
+        )
     dist_feats = [(torch.from_numpy(ia), torch.from_numpy(dist), torch.from_numpy(xsign))]
 
-    return velocity_in, pos, t, velocity_out, idcs_airfoil, dist_feats
+    # k-NN features (loaded if cache exists, else None)
+    knn_path = path.replace(".npz", ".knncache.npz")
+    if os.path.exists(knn_path):
+        knn_feats = [torch.from_numpy(np.load(knn_path)["knn_idx"])]
+    else:
+        knn_feats = [None]
+
+    return velocity_in, pos, t, velocity_out, idcs_airfoil, dist_feats, knn_feats
 
 
 def _rel_l2(pred, target):
@@ -321,182 +334,214 @@ def plot_error_map(pos_np, pred_np, gt_np, timestep=0, save_path=None):
 
 # ── Slice assignment visualisation ───────────────────────────────────────────
 
-@torch.no_grad()
-def plot_slice_assignments(model, pos_np, velocity_in, pos, t, idcs_airfoil,
-                           dist_feats, layer_idx=0, save_path=None):
+def _slice_entropy_stats(sw: np.ndarray, layer_label: str = "") -> np.ndarray:
     """
-    Visualise what the Physics-Attention slices have learned.
+    Compute and print entropy stats for slice weights.
 
-    Produces two figures:
-      (a) Dominant slice map — XZ scatter coloured by argmax(slice_weights),
-          one panel per attention head. If the slices are physically meaningful
-          you'll see spatial structure (freestream, wake, boundary layer).
-          If they're mushy you'll see random salt-and-pepper noise.
+    sw : (H, N, M) float32 numpy array
+    Returns entropy (N,) averaged over heads.
+    """
+    eps     = 1e-9
+    M       = sw.shape[-1]
+    max_ent = np.log(M)
+    entropy = -(sw * np.log(sw + eps)).sum(axis=-1).mean(axis=0)  # (N,)
+    mean_frac = entropy.mean() / max_ent
 
-      (b) Slice entropy map — XZ scatter coloured by the entropy of the slice
-          weight distribution at each point. Low entropy (dark) = point
-          strongly assigned to one slice. High entropy (bright) = mushy,
-          point spreads mass across all slices equally.
-          A well-trained model should show low entropy in the freestream
-          (clean laminar regime) and moderate entropy in the wake (turbulence
-          genuinely lives in multiple regimes at once).
+    tag = f" — {layer_label}" if layer_label else ""
+    print(f"\nSlice assignment entropy{tag}:")
+    print(f"  M={M} slices  |  max entropy = {max_ent:.3f} nats")
+    print(f"  Mean   = {entropy.mean():.3f} nats  ({mean_frac*100:.1f}% of max)")
+    print(f"  Median = {np.median(entropy):.3f} nats")
+    if mean_frac < 0.40:
+        verdict = "Sharp — slices have learned distinct physical regimes."
+    elif mean_frac < 0.65:
+        verdict = "Moderate — some spatial structure present."
+    else:
+        verdict = "MUSHY (>65% of max) — slices barely differentiated; model may be underfitting."
+    print(f"  → {verdict}")
+    return entropy
 
-    Args:
-        layer_idx : which Transolver block to inspect (0 = first, -1 = last)
+
+@torch.no_grad()
+@torch.no_grad()
+def _extract_slice_weights(model, pos, velocity_in, idcs_airfoil, t,
+                            dist_feats, knn_feats, layer_idx: int):
+    """
+    Run the model encoder + blocks up to layer_idx and return (B, H, N, M)
+    slice weight tensor on CPU.
     """
     from models.transolver_residual.features import compute_features
-    from models.transolver_residual.polynomial import poly_extrapolate
 
     device = next(model.parameters()).device
+    feats  = compute_features(
+        pos, velocity_in, idcs_airfoil, t,
+        poly_degree          = model.poly_degree,
+        dist_feats           = dist_feats,
+        use_local_feats      = model.use_local_feats,
+        use_temporal_deltas  = model.use_temporal_deltas,
+        knn_feats            = knn_feats,
+    )
+    x = model.encoder(feats)           # (B, N, C)
+
+    n_blocks = len(model.blocks)
+    target   = n_blocks + layer_idx if layer_idx < 0 else min(layer_idx, n_blocks - 1)
+    for i, block in enumerate(model.blocks):
+        if i == target:
+            break
+        x = block(x)
+
+    block  = model.blocks[target]
+    attn   = block.attn
+    B, N, C = x.shape
+    normed = block.norm1(x)
+
+    x_mid = (attn.proj_x(normed)
+               .reshape(B, N, attn.heads, attn.dim_head)
+               .permute(0, 2, 1, 3))                     # (B, H, N, dim_head)
+    temp  = attn.temperature.clamp(0.1, 5.0)
+    sw    = torch.softmax(attn.proj_slice(x_mid) / temp, dim=-1)   # (B, H, N, M)
+    return sw[0].cpu().float().numpy(), target   # (H, N, M), int
+
+
+@torch.no_grad()
+def plot_slice_assignments(model, pos_np, velocity_in, pos, t, idcs_airfoil,
+                           dist_feats, knn_feats=None, layer_idx=0, save_path=None):
+    """
+    Visualise Physics-Attention slice assignments.  Produces two figures:
+
+    Figure A — Per-slice weight heatmaps (one panel per slice, averaged over
+               heads, interpolated to XZ grid).  This is the same visualization
+               as Figure 1 in the Transolver paper.  Each panel shows which
+               region of the flow belongs to that slice.  Spatially coherent
+               blobs = attention is working; uniform noise = mushy.
+
+    Figure B — Entropy map + histogram.  Low entropy = point is sharply
+               assigned to one slice (freestream behaves predictably).
+               High entropy = point is spread across many slices (wake,
+               boundary layer — legitimately ambiguous physics).
+    """
     model.eval()
 
-    # ── Run encoder to get per-point embeddings ───────────────────────────────
-    with torch.no_grad():
-        feats = compute_features(
-            pos, velocity_in, idcs_airfoil, t,
-            poly_degree=model.poly_degree, dist_feats=dist_feats,
-        )
-        x = model.encoder(feats)                    # (1, N, C)
-        # Run blocks up to the target layer
-        n_blocks = len(model.blocks)
-        target = n_blocks + layer_idx if layer_idx < 0 else layer_idx
-        for i, block in enumerate(model.blocks):
-            if i == target:
-                break
-            x = block(x)
-        # Extract slice weights from the target block's attention
-        block = model.blocks[target]
-        attn  = block.attn
-        B, N, C = x.shape
-        normed = block.norm1(x)
-
-        # Replicate PhysicsAttention slice computation
-        x_mid = attn.proj_x(normed).reshape(B, N, attn.heads, attn.dim_head) \
-                     .permute(0, 2, 1, 3)                   # (B, H, N, dim_head)
-        temp  = attn.temperature.clamp(0.1, 5.0)
-        slice_weights = torch.softmax(
-            attn.proj_slice(x_mid) / temp, dim=-1
-        )                                                   # (B, H, N, M)
-
-    # slice_weights: (1, H, N, M) — bring to CPU numpy
-    sw = slice_weights[0].cpu().float().numpy()             # (H, N, M)
+    sw, target = _extract_slice_weights(
+        model, pos, velocity_in, idcs_airfoil, t,
+        dist_feats, knn_feats, layer_idx,
+    )
     H, N, M = sw.shape
 
-    pos_xz = pos_np[:, [0, 2]]    # (N, 2) — X and Z coords
-    surf_mask = np.zeros(N, dtype=bool)
-    surf_mask[idcs_airfoil[0].numpy()] = True
+    # Mean over heads → (N, M) — one weight per point per slice
+    sw_mean = sw.mean(axis=0)   # (N, M)
 
-    # ── Figure (a): Dominant slice per head ──────────────────────────────────
-    cols  = min(4, H)
-    rows  = (H + cols - 1) // cols
-    fig_a, axes = plt.subplots(rows, cols, figsize=(5 * cols, 4 * rows),
-                                facecolor="#111111")
-    axes = np.array(axes).reshape(rows, cols)
+    # ── Entropy stats (always printed) ────────────────────────────────────────
+    entropy = _slice_entropy_stats(sw, layer_label=f"layer {target}")
+    max_ent = np.log(M)
+
+    # ── Figure A: Per-slice weight heatmaps ───────────────────────────────────
+    # Lay out M slices in a grid, each showing where that slice concentrates.
+    # Inspired directly by Fig 1 of Wu et al. (Transolver, ICML 2024).
+    n_cols = 8
+    n_rows = (M + n_cols - 1) // n_cols
+
+    fig_a, axes = plt.subplots(
+        n_rows, n_cols,
+        figsize=(2.5 * n_cols, 2.2 * n_rows),
+        facecolor="#0a0a0a",
+    )
+    axes = np.array(axes).reshape(n_rows, n_cols)
     fig_a.suptitle(
-        f"Dominant slice assignment — layer {target}  "
-        f"(structured = Physics-Attention working, noise = not working)",
-        color="white", fontsize=11,
+        f"Per-slice weight maps — layer {target}  "
+        f"({M} slices, avg over {H} heads)\n"
+        f"Bright region = points assigned to this slice  "
+        f"|  structure = working,  uniform noise = mushy",
+        color="white", fontsize=10, y=1.01,
     )
 
-    cmap_slices = plt.get_cmap("tab20", M)
-    subsample = max(1, N // 20_000)   # show at most 20k points for speed
+    extent = [pos_np[:, 0].min(), pos_np[:, 0].max(),
+              pos_np[:, 2].min(), pos_np[:, 2].max()]
 
-    for h in range(H):
-        r, c   = divmod(h, cols)
-        ax     = axes[r, c]
-        ax.set_facecolor("#111111")
-        dom    = sw[h, ::subsample].argmax(axis=-1)   # (N//sub,) dominant slice index
-        px, pz = pos_xz[::subsample, 0], pos_xz[::subsample, 1]
-        sc = ax.scatter(px, pz, c=dom, cmap=cmap_slices,
-                        vmin=0, vmax=M - 1, s=0.3, linewidths=0)
-        # Overlay airfoil surface in white
-        sf_sub = surf_mask[::subsample]
-        ax.scatter(px[sf_sub], pz[sf_sub], c="white", s=0.8, linewidths=0)
-        ax.set_title(f"Head {h}", color="white", fontsize=9)
-        ax.set_xlabel("X", color="white", fontsize=7)
-        ax.set_ylabel("Z", color="white", fontsize=7)
-        ax.tick_params(colors="white", labelsize=6)
+    # Sort slices by how much "mass" they carry (descending) so the active
+    # slices appear first and dead/degenerate ones come last.
+    slice_mass = sw_mean.sum(axis=0)               # (M,) — total weight across all points
+    sorted_slices = np.argsort(slice_mass)[::-1]   # most active first
+
+    for panel_idx in range(n_rows * n_cols):
+        r, c = divmod(panel_idx, n_cols)
+        ax   = axes[r, c]
+        ax.set_facecolor("#0a0a0a")
+
+        if panel_idx >= M:
+            ax.set_visible(False)
+            continue
+
+        m   = sorted_slices[panel_idx]
+        wts = sw_mean[:, m]                        # (N,) weight of slice m at each point
+        grid, xi, zi = _interp_xz(pos_np, wts)
+
+        im = ax.imshow(
+            grid.T, origin="lower", aspect="auto",
+            extent=extent, cmap="hot",
+            vmin=0, vmax=wts.max(),
+            interpolation="bilinear",
+        )
+        mass_pct = slice_mass[m] / slice_mass.sum() * 100
+        ax.set_title(f"s{m}  ({mass_pct:.1f}%)", color="white", fontsize=6, pad=2)
+        ax.set_xticks([]); ax.set_yticks([])
         for sp in ax.spines.values():
-            sp.set_edgecolor("#444444")
+            sp.set_edgecolor("#333333")
 
-    # Hide unused subplots
-    for h in range(H, rows * cols):
-        r, c = divmod(h, cols)
-        axes[r, c].set_visible(False)
-
-    plt.tight_layout()
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
     if save_path:
-        p = save_path.replace(".png", f"_dominant_layer{target}.png")
-        fig_a.savefig(p, dpi=120, bbox_inches="tight", facecolor="#111111")
+        p = save_path.replace(".png", f"_slices_layer{target}.png")
+        fig_a.savefig(p, dpi=130, bbox_inches="tight", facecolor="#0a0a0a")
         print(f"Saved: {p}")
 
-    # ── Figure (b): Entropy map (averaged over heads) ─────────────────────────
-    # Entropy of slice distribution per point per head, averaged over heads
-    eps     = 1e-9
-    entropy = -(sw * np.log(sw + eps)).sum(axis=-1)   # (H, N)
-    entropy = entropy.mean(axis=0)                     # (N,) mean over heads
-    max_ent = np.log(M)                                # maximum possible entropy
-
+    # ── Figure B: Entropy heatmap + histogram ─────────────────────────────────
     fig_b, axes2 = plt.subplots(1, 2, figsize=(14, 5), facecolor="#111111")
     fig_b.suptitle(
         f"Slice assignment entropy — layer {target}  "
-        f"(low=sharp assignment, high=mushy/uninformative)",
-        color="white", fontsize=11,
+        f"(low=sharp, high=mushy)   mean={entropy.mean():.3f} / max={max_ent:.3f} "
+        f"({entropy.mean()/max_ent*100:.1f}%)",
+        color="white", fontsize=10,
     )
 
-    # Scatter
+    # Left panel: entropy heatmap on XZ grid
     ax = axes2[0]
     ax.set_facecolor("#111111")
-    px, pz = pos_xz[::subsample, 0], pos_xz[::subsample, 1]
-    sc = ax.scatter(px, pz, c=entropy[::subsample],
-                    cmap="plasma", vmin=0, vmax=max_ent, s=0.3, linewidths=0)
-    sf_sub = surf_mask[::subsample]
-    ax.scatter(px[sf_sub], pz[sf_sub], c="white", s=0.8, linewidths=0)
-    cb = plt.colorbar(sc, ax=ax, fraction=0.03)
+    ent_grid, xi, zi = _interp_xz(pos_np, entropy)
+    im = ax.imshow(
+        ent_grid.T, origin="lower", aspect="auto",
+        extent=extent, cmap="plasma",
+        vmin=0, vmax=max_ent, interpolation="bilinear",
+    )
+    cb = plt.colorbar(im, ax=ax, fraction=0.03)
     cb.set_label("Entropy (nats)", color="white", fontsize=8)
     cb.ax.yaxis.set_tick_params(color="white", labelcolor="white")
-    ax.axhline(y=0, color="#555555", lw=0.5, ls="--")
-    ax.set_title("Per-point entropy (XZ view, Y≈0)", color="white")
-    ax.set_xlabel("X", color="white")
-    ax.set_ylabel("Z", color="white")
+    ax.set_title("Per-point entropy (interpolated XZ)", color="white", fontsize=9)
+    ax.set_xlabel("X", color="white", fontsize=8)
+    ax.set_ylabel("Z", color="white", fontsize=8)
     ax.tick_params(colors="white", labelsize=7)
     for sp in ax.spines.values():
         sp.set_edgecolor("#444444")
 
-    # Histogram
+    # Right panel: histogram
     ax2 = axes2[1]
     ax2.set_facecolor("#111111")
-    ax2.hist(entropy, bins=60, color="#DD8452", edgecolor="none", alpha=0.85)
+    ax2.hist(entropy, bins=80, color="#DD8452", edgecolor="none", alpha=0.85)
     ax2.axvline(x=max_ent, color="#CC5555", lw=1.5, ls="--",
-                label=f"Max entropy (={max_ent:.2f})")
+                label=f"Max entropy = {max_ent:.2f}")
     ax2.axvline(x=entropy.mean(), color="#55CC55", lw=1.5, ls="--",
-                label=f"Mean = {entropy.mean():.2f}")
+                label=f"Mean = {entropy.mean():.2f}  ({entropy.mean()/max_ent*100:.0f}%)")
     ax2.set_xlabel("Entropy (nats)", color="white")
     ax2.set_ylabel("Point count", color="white")
-    ax2.set_title("Entropy distribution over all points", color="white")
+    ax2.set_title("Entropy distribution", color="white")
     ax2.tick_params(colors="white")
     ax2.legend(facecolor="#222222", labelcolor="white", fontsize=9)
     for sp in ax2.spines.values():
         sp.set_edgecolor("#444444")
 
-    mean_frac = entropy.mean() / max_ent
-    print(f"\nSlice assignment analysis — layer {target}:")
-    print(f"  Max possible entropy:  {max_ent:.3f} nats  (= all slices equally likely)")
-    print(f"  Mean entropy:          {entropy.mean():.3f} nats  ({mean_frac*100:.1f}% of max)")
-    print(f"  Median entropy:        {np.median(entropy):.3f} nats")
-    print()
-    if mean_frac < 0.5:
-        print("  → Sharp assignments: Physics-Attention is learning distinct regimes.")
-    elif mean_frac < 0.75:
-        print("  → Moderate sharpness: Some structure, but not maximally informative.")
-    else:
-        print("  → Mushy assignments (>75% of max entropy): slices may not be contributing.")
-        print("    Consider: more training, higher temperature init, or drop Transolver blocks.")
-
     plt.tight_layout()
     if save_path:
         p = save_path.replace(".png", f"_entropy_layer{target}.png")
-        fig_b.savefig(p, dpi=120, bbox_inches="tight", facecolor="#111111")
+        fig_b.savefig(p, dpi=130, bbox_inches="tight", facecolor="#111111")
         print(f"Saved: {p}")
 
     return fig_a, fig_b
@@ -517,9 +562,9 @@ def evaluate_n_samples(model, files, n, device, save_dir=None):
     all_poly  = []
 
     for path in chosen:
-        velocity_in, pos, t, velocity_out, idcs_airfoil, dist_feats = _load_sample(path, device)
+        velocity_in, pos, t, velocity_out, idcs_airfoil, dist_feats, knn_feats = _load_sample(path, device)
 
-        pred = model(t, pos, idcs_airfoil, velocity_in, dist_feats)
+        pred = model(t, pos, idcs_airfoil, velocity_in, dist_feats, knn_feats)
         poly = poly_extrapolate(velocity_in, t, degree=2)
 
         gt_np   = velocity_out[0].cpu().numpy()   # (5, N, 3)
@@ -602,12 +647,16 @@ def main():
                         help="Which Transolver block to inspect for slice vis (0=first, -1=last)")
 
     # Model hyperparams (must match training)
-    parser.add_argument("--n_layers",   type=int,   default=8)
-    parser.add_argument("--hidden_dim", type=int,   default=256)
-    parser.add_argument("--n_heads",    type=int,   default=8)
-    parser.add_argument("--slice_num",  type=int,   default=32)
-    parser.add_argument("--mlp_ratio",  type=int,   default=1)
-    parser.add_argument("--dropout",    type=float, default=0.0)
+    parser.add_argument("--n_layers",            type=int,   default=8)
+    parser.add_argument("--hidden_dim",          type=int,   default=256)
+    parser.add_argument("--n_heads",             type=int,   default=8)
+    parser.add_argument("--slice_num",           type=int,   default=32)
+    parser.add_argument("--mlp_ratio",           type=int,   default=1)
+    parser.add_argument("--dropout",             type=float, default=0.0)
+    parser.add_argument("--use_local_feats",     action="store_true",
+                        help="Must be set if the model was trained with --use_local_feats")
+    parser.add_argument("--use_temporal_deltas", action="store_true",
+                        help="Must be set if the model was trained with --use_temporal_deltas")
 
     args = parser.parse_args()
 
@@ -621,12 +670,14 @@ def main():
 
     # ── Load model ─────────────────────────────────────────────────────────────
     model = TransolverResidual(
-        n_layers    = args.n_layers,
-        hidden_dim  = args.hidden_dim,
-        n_heads     = args.n_heads,
-        slice_num   = args.slice_num,
-        mlp_ratio   = args.mlp_ratio,
-        dropout     = args.dropout,
+        n_layers             = args.n_layers,
+        hidden_dim           = args.hidden_dim,
+        n_heads              = args.n_heads,
+        slice_num            = args.slice_num,
+        mlp_ratio            = args.mlp_ratio,
+        dropout              = args.dropout,
+        use_local_feats      = args.use_local_feats,
+        use_temporal_deltas  = args.use_temporal_deltas,
     ).to(device)
     model.eval()
     print(f"Model loaded  ({model.num_params():,} params)")
@@ -667,10 +718,10 @@ def main():
              "unknown": "\033[91mUNKNOWN\033[0m"}.get(split, split)
     print(f"Split membership: {label}")
 
-    velocity_in, pos, t, velocity_out, idcs_airfoil, dist_feats = _load_sample(path, device)
+    velocity_in, pos, t, velocity_out, idcs_airfoil, dist_feats, knn_feats = _load_sample(path, device)
 
     with torch.no_grad():
-        pred = model(t, pos, idcs_airfoil, velocity_in, dist_feats)
+        pred = model(t, pos, idcs_airfoil, velocity_in, dist_feats, knn_feats)
         poly = poly_extrapolate(velocity_in, t, degree=2)
 
     pos_np    = pos[0].cpu().numpy()
@@ -688,6 +739,16 @@ def main():
     for i, (pm, pp) in enumerate(zip(model_losses, poly_losses)):
         gain = (pp - pm) / pp * 100
         print(f"t{5+i}:    {pp:>8.4f}  {pm:>8.4f}  {gain:>+7.1f}%")
+
+    # Always print slice entropy for first, middle, and last layer so we can
+    # monitor whether Physics-Attention is routing correctly without --slice_vis.
+    print("\n── Slice entropy quick-check (no figures) ──")
+    n_blocks = len(model.blocks)
+    for lidx in sorted({0, n_blocks // 2, n_blocks - 1}):
+        sw_l, tgt_l = _extract_slice_weights(
+            model, pos, velocity_in, idcs_airfoil, t, dist_feats, knn_feats, lidx
+        )
+        _slice_entropy_stats(sw_l, layer_label=f"layer {tgt_l}")
 
     sp = lambda name: os.path.join(args.save_dir, name) if args.save_dir else None
 
@@ -712,10 +773,13 @@ def main():
     )
 
     if args.slice_vis:
-        for layer_idx in ([args.slice_layer] if args.slice_layer >= 0
-                          else [0, len(model.blocks) // 2, -1]):
+        n_blocks = len(model.blocks)
+        layers = ([args.slice_layer] if args.slice_layer >= 0
+                  else [0, n_blocks // 2, n_blocks - 1])
+        for layer_idx in layers:
             plot_slice_assignments(
-                model, pos_np, velocity_in, pos, t, idcs_airfoil, dist_feats,
+                model, pos_np, velocity_in, pos, t, idcs_airfoil,
+                dist_feats, knn_feats,
                 layer_idx=layer_idx,
                 save_path=sp("slice_vis.png"),
             )

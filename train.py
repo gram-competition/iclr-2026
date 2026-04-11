@@ -122,7 +122,7 @@ def run_epoch(model, loader, optimizer, device, accum_steps, is_train):
     if is_train:
         optimizer.zero_grad()
 
-    for step, ((velocity_in, pos, idcs_airfoil, t, dist_feats), velocity_out) in enumerate(loader):
+    for step, ((velocity_in, pos, idcs_airfoil, t, dist_feats, knn_feats), velocity_out) in enumerate(loader):
         velocity_in  = velocity_in.to(device,  non_blocking=True)
         pos          = pos.to(device,          non_blocking=True)
         t            = t.to(device,            non_blocking=True)
@@ -130,7 +130,7 @@ def run_epoch(model, loader, optimizer, device, accum_steps, is_train):
 
         with torch.set_grad_enabled(is_train):
             with autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
-                pred = model(t, pos, idcs_airfoil, velocity_in, dist_feats)
+                pred = model(t, pos, idcs_airfoil, velocity_in, dist_feats, knn_feats)
                 loss = variance_weighted_loss(pred, velocity_out, velocity_in)
                 if is_train:
                     loss = loss / accum_steps
@@ -162,14 +162,14 @@ def val_detailed(model, loader, device):
     per_ts     = [0.0] * 5
     n_batches  = 0
 
-    for (velocity_in, pos, idcs_airfoil, t, dist_feats), velocity_out in loader:
+    for (velocity_in, pos, idcs_airfoil, t, dist_feats, knn_feats), velocity_out in loader:
         velocity_in  = velocity_in.to(device,  non_blocking=True)
         pos          = pos.to(device,          non_blocking=True)
         t            = t.to(device,            non_blocking=True)
         velocity_out = velocity_out.to(device, non_blocking=True)
 
         with autocast("cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")):
-            pred = model(t, pos, idcs_airfoil, velocity_in, dist_feats)
+            pred = model(t, pos, idcs_airfoil, velocity_in, dist_feats, knn_feats)
 
         total_loss += relative_l2(pred, velocity_out).item()
         ts_losses   = per_timestep_rel_l2(pred, velocity_out)
@@ -218,6 +218,11 @@ def main():
                              " Use this to continue a previous run. Omit for a fresh start.")
     parser.add_argument("--augment", action="store_true",
                         help="Enable y-flip augmentation on the training set.")
+    parser.add_argument("--use_local_feats", action="store_true",
+                        help="Add mean velocity of 8 nearest neighbours as features (+15 ch). "
+                             "Requires knn cache (built automatically by runner.sh).")
+    parser.add_argument("--use_temporal_deltas", action="store_true",
+                        help="Add velocity differences Δv_t = v_t - v_{t-1} as features (+12 ch).")
 
     args = parser.parse_args()
 
@@ -244,18 +249,21 @@ def main():
         num_workers=args.num_workers,
         seed=args.seed,
         augment=args.augment,
+        use_local_feats=args.use_local_feats,
     )
 
     # ── Model ──────────────────────────────────────────────────────────────────
     model = TransolverResidual(
-        n_layers     = args.n_layers,
-        hidden_dim   = args.hidden_dim,
-        n_heads      = args.n_heads,
-        slice_num    = args.slice_num,
-        mlp_ratio    = args.mlp_ratio,
-        dropout      = args.dropout,
-        poly_degree  = args.poly_degree,
-        load_weights = args.resume,
+        n_layers             = args.n_layers,
+        hidden_dim           = args.hidden_dim,
+        n_heads              = args.n_heads,
+        slice_num            = args.slice_num,
+        mlp_ratio            = args.mlp_ratio,
+        dropout              = args.dropout,
+        poly_degree          = args.poly_degree,
+        use_local_feats      = args.use_local_feats,
+        use_temporal_deltas  = args.use_temporal_deltas,
+        load_weights         = args.resume,
     ).to(device)
 
     print(f"Parameters: {model.num_params():,}")
@@ -293,7 +301,8 @@ def main():
         print(f"Epoch {epoch:4d}/{args.epochs}  train={train_loss:.4f}  lr={lr_now:.2e}  ({elapsed:.0f}s)")
 
         # ── Validation ────────────────────────────────────────────────────────
-        if epoch % args.val_every == 0 or epoch == args.epochs:
+        has_val = len(val_loader) > 0
+        if has_val and (epoch % args.val_every == 0 or epoch == args.epochs):
             val_loss, per_ts = val_detailed(model, val_loader, device)
             writer.add_scalar("loss/val", val_loss, epoch)
             for i, v in enumerate(per_ts):
@@ -308,6 +317,12 @@ def main():
                 torch.save(model.state_dict(), best_ckpt)
                 shutil.copy(best_ckpt, weights_dst)
                 print(f"           ✓ new best — saved to {weights_dst}")
+
+        # When training on all data (no val set), save last epoch as the submission
+        if not has_val and epoch == args.epochs:
+            torch.save(model.state_dict(), best_ckpt)
+            shutil.copy(best_ckpt, weights_dst)
+            print(f"           ✓ final weights saved to {weights_dst}")
 
         # ── Periodic checkpoint ───────────────────────────────────────────────
         if epoch % 20 == 0:

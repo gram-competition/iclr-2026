@@ -3,12 +3,16 @@ TransolverResidual — full model for GRaM transient airflow prediction.
 
 Forward pass:
     1. Polynomial extrapolation (no learned params) → baseline prediction
-    2. Per-point feature computation (~52 channels)
-    3. Per-point MLP encoder: 52 → hidden_dim
+    2. Per-point feature computation (52–79 channels depending on flags)
+    3. Per-point MLP encoder: D → hidden_dim
     4. L × Transolver blocks (Physics-Attention on irregular 3-D mesh)
     5. Per-point MLP decoder: hidden_dim → 15  (5 timesteps × 3 components)
     6. Output = poly_baseline + learned_correction
     7. Hard zero on airfoil surface (no-slip enforcement)
+
+Optional feature flags (must match between training and inference):
+    use_local_feats     : add mean velocity of 8 nearest neighbours (+15 ch)
+    use_temporal_deltas : add velocity differences Δv_t = v_t - v_{t-1} (+12 ch)
 
 The model only learns the turbulent *correction* on top of the polynomial
 baseline. This means:
@@ -21,9 +25,11 @@ import os
 import torch
 import torch.nn as nn
 
-from models.transolver_residual.features        import compute_features, FEATURE_DIM
+from models.transolver_residual.features        import (
+    compute_features, get_feature_dim
+)
 from models.transolver_residual.physics_attention import TransolverBlock
-from models.transolver_residual.polynomial      import poly_extrapolate
+from models.transolver_residual.polynomial        import poly_extrapolate
 
 
 class TransolverResidual(nn.Module):
@@ -34,32 +40,41 @@ class TransolverResidual(nn.Module):
     from the same directory when a weights file is present.
 
     Args:
-        n_layers    : number of Transolver blocks (default 8)
-        hidden_dim  : token / hidden dimension (default 256)
-        n_heads     : attention heads in Physics-Attention (default 8)
-        slice_num   : number of physics slices M (default 32)
-        mlp_ratio   : FFN expansion factor in each block (default 1)
-        dropout     : dropout probability (default 0.1)
-        poly_degree : degree of polynomial extrapolation baseline (default 2)
+        n_layers             : number of Transolver blocks (default 8)
+        hidden_dim           : token / hidden dimension (default 256)
+        n_heads              : attention heads in Physics-Attention (default 8)
+        slice_num            : number of physics slices M (default 32)
+        mlp_ratio            : FFN expansion factor in each block (default 1)
+        dropout              : dropout probability (default 0.1)
+        poly_degree          : degree of polynomial extrapolation baseline (default 2)
+        use_local_feats      : append mean neighbour velocity to features (default False)
+        use_temporal_deltas  : append velocity differences to features (default False)
+        load_weights         : auto-load weights.pt if present (default True)
     """
 
     def __init__(
         self,
-        n_layers:     int   = 8,
-        hidden_dim:   int   = 256,
-        n_heads:      int   = 8,
-        slice_num:    int   = 32,
-        mlp_ratio:    int   = 1,
-        dropout:      float = 0.1,
-        poly_degree:  int   = 2,
-        load_weights: bool  = True,
+        n_layers:            int   = 8,
+        hidden_dim:          int   = 256,
+        n_heads:             int   = 8,
+        slice_num:           int   = 32,
+        mlp_ratio:           int   = 1,
+        dropout:             float = 0.1,
+        poly_degree:         int   = 2,
+        use_local_feats:     bool  = False,
+        use_temporal_deltas: bool  = False,
+        load_weights:        bool  = True,
     ):
         super().__init__()
-        self.poly_degree = poly_degree
+        self.poly_degree         = poly_degree
+        self.use_local_feats     = use_local_feats
+        self.use_temporal_deltas = use_temporal_deltas
 
-        # ── Encoder: per-point MLP  52 → hidden_dim ─────────────────────────
+        feature_dim = get_feature_dim(use_local_feats, use_temporal_deltas)
+
+        # ── Encoder: per-point MLP  D → hidden_dim ──────────────────────────
         self.encoder = nn.Sequential(
-            nn.Linear(FEATURE_DIM, hidden_dim * 2),
+            nn.Linear(feature_dim, hidden_dim * 2),
             nn.GELU(),
             nn.Linear(hidden_dim * 2, hidden_dim),
         )
@@ -92,7 +107,10 @@ class TransolverResidual(nn.Module):
                     self.load_state_dict(state)
                     print("[TransolverResidual] Loaded weights from weights.pt")
                 except RuntimeError as e:
-                    print(f"[TransolverResidual] weights.pt is incompatible with current architecture — starting from scratch.\n  ({e})")
+                    print(
+                        f"[TransolverResidual] weights.pt incompatible with current "
+                        f"architecture — starting from scratch.\n  ({e})"
+                    )
 
     # ── Initialisation ────────────────────────────────────────────────────────
 
@@ -117,7 +135,8 @@ class TransolverResidual(nn.Module):
         pos:          torch.Tensor,        # (B, N, 3)
         idcs_airfoil: list,                # list[B] of variable-length int tensors
         velocity_in:  torch.Tensor,        # (B, 5, N, 3)
-        dist_feats:   list = None,         # list[B] of precomputed (ia, dist, xsign) — (N,) each
+        dist_feats:   list = None,         # list[B] of (ia, dist, xsign) — (N,) each
+        knn_feats:    list = None,         # list[B] of (N, k) int tensors, or None
     ) -> torch.Tensor:                     # (B, 5, N, 3)
 
         B, T_in, N, _ = velocity_in.shape
@@ -131,7 +150,10 @@ class TransolverResidual(nn.Module):
         feats = compute_features(
             pos, velocity_in, idcs_airfoil, t, self.poly_degree,
             dist_feats=dist_feats,
-        )                                              # (B, N, 52)
+            use_local_feats=self.use_local_feats,
+            use_temporal_deltas=self.use_temporal_deltas,
+            knn_feats=knn_feats,
+        )                                              # (B, N, D)
 
         # ── 3. MLP encoder ────────────────────────────────────────────────────
         x = self.encoder(feats)                        # (B, N, hidden_dim)

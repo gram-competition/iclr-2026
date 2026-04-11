@@ -3,7 +3,7 @@ import torch
 from models import TransolverResidual as Model
 
 # The model constructor has to be callable without arguments
-model = Model()
+model = Model(use_local_feats=True, use_temporal_deltas=True)
 
 # Dimensions of the data
 BATCH_SIZE = 95  # number of point clouds in the test split
