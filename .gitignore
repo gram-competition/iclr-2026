@@ -4,3 +4,7 @@
 *.pyc
 *.gif
 events.*
+CLAUDE.MD
+/geometries/
+/out/*
+
