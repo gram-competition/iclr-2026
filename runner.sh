@@ -80,7 +80,7 @@ python3 train.py \
     --lr 1e-3 \
     --accum_steps 4 \
     --num_workers 16 \
-    --train_fraction 0.9 \
+    --train_fraction 1.0 \
     --augment \
     --use_local_feats \
     --use_temporal_deltas \

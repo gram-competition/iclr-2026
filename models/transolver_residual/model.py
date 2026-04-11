@@ -26,7 +26,8 @@ import torch
 import torch.nn as nn
 
 from models.transolver_residual.features        import (
-    compute_features, get_feature_dim
+    compute_features, get_feature_dim,
+    precompute_distance_features, precompute_knn,
 )
 from models.transolver_residual.physics_attention import TransolverBlock
 from models.transolver_residual.polynomial        import poly_extrapolate
@@ -61,8 +62,8 @@ class TransolverResidual(nn.Module):
         mlp_ratio:           int   = 1,
         dropout:             float = 0.1,
         poly_degree:         int   = 2,
-        use_local_feats:     bool  = False,
-        use_temporal_deltas: bool  = False,
+        use_local_feats:     bool  = True,
+        use_temporal_deltas: bool  = True,
         load_weights:        bool  = True,
     ):
         super().__init__()
@@ -98,6 +99,13 @@ class TransolverResidual(nn.Module):
         # ── Weight initialisation ─────────────────────────────────────────────
         self._init_weights()
 
+        # ── Geometry cache (keyed by pos fingerprint) ─────────────────────────
+        # Populated lazily on the first forward call for each geometry.
+        # Avoids recomputing dist/knn features for the same geometry across
+        # multiple time windows or repeated calls by the evaluator.
+        self._dist_cache: dict = {}   # fingerprint → (ia, dist, xsign) CPU tensors
+        self._knn_cache:  dict = {}   # fingerprint → (N, k) int64 CPU tensor
+
         # ── Auto-load weights if present ──────────────────────────────────────
         if load_weights:
             weights_path = os.path.join(os.path.dirname(__file__), "weights.pt")
@@ -127,6 +135,55 @@ class TransolverResidual(nn.Module):
         nn.init.zeros_(self.decoder.weight)
         nn.init.zeros_(self.decoder.bias)
 
+    # ── Geometry cache helpers ────────────────────────────────────────────────
+
+    @staticmethod
+    def _fingerprint(pos_b: torch.Tensor) -> tuple:
+        """
+        Cheap, collision-resistant fingerprint for a single (N, 3) pos tensor.
+        Uses shape + a few scattered values — fast and unique enough for
+        distinct CFD meshes.
+        """
+        p = pos_b.cpu().float()
+        N = p.shape[0]
+        return (N,
+                float(p[0].sum()),
+                float(p[N // 4].sum()),
+                float(p[N // 2].sum()),
+                float(p[-1].sum()))
+
+    def _ensure_geometry_cache(
+        self,
+        pos: torch.Tensor,         # (B, N, 3)
+        idcs_airfoil: list,        # list[B]
+    ):
+        """
+        Populate dist_cache and knn_cache for any geometry not yet seen.
+        Called once at the start of forward() when the caller does not supply
+        precomputed caches (i.e. at evaluation / competition inference time).
+        """
+        for b in range(pos.shape[0]):
+            fp = self._fingerprint(pos[b])
+
+            if fp not in self._dist_cache:
+                print(f"[TransolverResidual] precomputing dist features for sample {b} ...",
+                      flush=True)
+                ia, dist, xsign = precompute_distance_features(
+                    pos[b].cpu().float().numpy(),
+                    idcs_airfoil[b].cpu().numpy().astype("int64"),
+                )
+                self._dist_cache[fp] = (
+                    torch.from_numpy(ia),
+                    torch.from_numpy(dist),
+                    torch.from_numpy(xsign),
+                )
+
+            if self.use_local_feats and fp not in self._knn_cache:
+                print(f"[TransolverResidual] precomputing k-NN for sample {b} ...",
+                      flush=True)
+                knn_idx = precompute_knn(pos[b].cpu().float().numpy())
+                self._knn_cache[fp] = torch.from_numpy(knn_idx.astype("int64"))
+
     # ── Forward ───────────────────────────────────────────────────────────────
 
     def forward(
@@ -140,6 +197,19 @@ class TransolverResidual(nn.Module):
     ) -> torch.Tensor:                     # (B, 5, N, 3)
 
         B, T_in, N, _ = velocity_in.shape
+
+        # ── 0. Geometry precomputation (inference path) ───────────────────────
+        # When dist_feats or knn_feats are not supplied (e.g. competition
+        # evaluator calling main.py), compute them now and cache by geometry
+        # fingerprint so repeated calls for the same mesh are instant.
+        if dist_feats is None or (self.use_local_feats and knn_feats is None):
+            self._ensure_geometry_cache(pos, idcs_airfoil)
+
+        if dist_feats is None:
+            dist_feats = [self._dist_cache[self._fingerprint(pos[b])] for b in range(B)]
+
+        if self.use_local_feats and knn_feats is None:
+            knn_feats = [self._knn_cache[self._fingerprint(pos[b])] for b in range(B)]
 
         # ── 1. Polynomial baseline ────────────────────────────────────────────
         poly_pred = poly_extrapolate(
