@@ -1,16 +1,6 @@
-"""kagent submission — voxel-UNet residual model with SDF wall-distance feature.
+"""kagent submission."""
 
-Trained autonomously by a coding agent ("alphonse") on the public warped-ifw
-dataset. Best checkpoint at val/l2_error = 0.8707.
-
-Architecture:
-  - Normalise velocities per-component (buffers from stats.json)
-  - Per-point features: [5 past velocities, pos, airfoil mask, sdf, log1p(sdf)]
-  - ResMLP pre-blocks, 3D voxel-UNet spatial mix, ResMLP post-blocks
-  - Predict residual from last input frame in normalised space
-  - Enforce no-slip by zeroing velocity at idcs_airfoil
-"""
-
+import math
 import os
 
 import torch
@@ -21,179 +11,222 @@ import torch.nn.functional as F
 T_IN = 5
 T_OUT = 5
 
-
-def _compute_sdf(pos: torch.Tensor, airfoil_idcs: torch.Tensor, chunk: int = 2048) -> torch.Tensor:
-    """Per-point Euclidean distance to the nearest airfoil point (single sample)."""
-    a = pos[airfoil_idcs.to(pos.device)]
-    sdf = torch.full((pos.shape[0],), float("inf"), device=pos.device, dtype=pos.dtype)
-    for s in range(0, a.shape[0], chunk):
-        d = torch.cdist(pos, a[s:s + chunk]).min(dim=-1).values
-        sdf = torch.minimum(sdf, d)
-    return sdf
+DOMAIN_MIN = torch.tensor([0.0, -0.41, 0.0])
+DOMAIN_MAX = torch.tensor([2.10, 0.41, 1.22])
 
 
-class ResBlock(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.LayerNorm(dim),
-            nn.Linear(dim, dim * 2),
-            nn.GELU(),
-            nn.Linear(dim * 2, dim),
-        )
-
-    def forward(self, x):
-        return x + self.net(x)
+def _fourier(x: torch.Tensor, num_freqs: int) -> torch.Tensor:
+    freqs = 2.0 ** torch.arange(num_freqs, device=x.device, dtype=x.dtype) * math.pi
+    xf = x.unsqueeze(-1) * freqs
+    enc = torch.cat([xf.sin(), xf.cos()], dim=-1).reshape(*x.shape[:-1], -1)
+    return torch.cat([x, enc], dim=-1)
 
 
-class ConvBlock3D(nn.Module):
-    def __init__(self, c_in, c_out, groups=8):
+def _compute_dist(pos: torch.Tensor, idcs_airfoil: list) -> torch.Tensor:
+    B, N, _ = pos.shape
+    out = torch.empty(B, N, device=pos.device, dtype=pos.dtype)
+    for b in range(B):
+        idx = idcs_airfoil[b].to(pos.device).long()
+        af = pos[b].index_select(0, idx)
+        chunks = [torch.cdist(chunk, af).min(dim=1).values for chunk in pos[b].split(8192)]
+        out[b] = torch.cat(chunks, dim=0)
+    return out
+
+
+class _DoubleConv(nn.Module):
+    def __init__(self, in_c, out_c):
         super().__init__()
         self.block = nn.Sequential(
-            nn.Conv3d(c_in, c_out, 3, padding=1),
-            nn.GroupNorm(groups, c_out),
-            nn.GELU(),
-            nn.Conv3d(c_out, c_out, 3, padding=1),
-            nn.GroupNorm(groups, c_out),
-            nn.GELU(),
+            nn.Conv3d(in_c, out_c, 3, padding=1),
+            nn.BatchNorm3d(out_c),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(out_c, out_c, 3, padding=1),
+            nn.BatchNorm3d(out_c),
+            nn.ReLU(inplace=True),
         )
 
     def forward(self, x):
         return self.block(x)
 
 
-class UNet3D(nn.Module):
-    def __init__(self, c_in, c_mid=64, c_out=None, groups=8):
+class _VoxelUNet(nn.Module):
+    def __init__(self, hidden, grid=(64, 32, 32), ch_base=64):
         super().__init__()
-        c_out = c_out or c_in
-        self.enc1 = ConvBlock3D(c_in, c_mid, groups)
-        self.enc2 = ConvBlock3D(c_mid, c_mid * 2, groups)
-        self.enc3 = ConvBlock3D(c_mid * 2, c_mid * 4, groups)
-        self.dec2 = ConvBlock3D(c_mid * 2 + c_mid * 4, c_mid * 2, groups)
-        self.dec1 = ConvBlock3D(c_mid + c_mid * 2, c_mid, groups)
-        self.out = nn.Conv3d(c_mid, c_out, 1)
+        self.grid = tuple(grid)
+        self.enc1 = _DoubleConv(hidden, ch_base)
+        self.enc2 = _DoubleConv(ch_base, ch_base * 2)
+        self.enc3 = _DoubleConv(ch_base * 2, ch_base * 4)
+        self.dec2 = _DoubleConv(ch_base * 4 + ch_base * 2, ch_base * 2)
+        self.dec1 = _DoubleConv(ch_base * 2 + ch_base, ch_base)
+        self.out = nn.Conv3d(ch_base, hidden, 1)
+        self.pool = nn.MaxPool3d(2)
+
+    def _voxelize(self, x, pos01):
+        B, N, C = x.shape
+        Gx, Gy, Gz = self.grid
+        idx = pos01.clamp(0, 1 - 1e-6)
+        idx = torch.stack([
+            (idx[..., 0] * Gx).floor().long(),
+            (idx[..., 1] * Gy).floor().long(),
+            (idx[..., 2] * Gz).floor().long(),
+        ], dim=-1)
+        flat = idx[..., 0] * (Gy * Gz) + idx[..., 1] * Gz + idx[..., 2]
+        voxel = torch.zeros(B, C, Gx * Gy * Gz, device=x.device, dtype=x.dtype)
+        count = torch.zeros(B, 1, Gx * Gy * Gz, device=x.device, dtype=x.dtype)
+        voxel.scatter_add_(2, flat.unsqueeze(1).expand(-1, C, -1), x.transpose(1, 2))
+        ones = torch.ones(B, 1, N, device=x.device, dtype=x.dtype)
+        count.scatter_add_(2, flat.unsqueeze(1), ones)
+        voxel = voxel / count.clamp(min=1.0)
+        return voxel.view(B, C, Gx, Gy, Gz)
+
+    def _devoxelize(self, voxel, pos01):
+        B, C = voxel.shape[:2]
+        N = pos01.shape[1]
+        p = pos01 * 2.0 - 1.0
+        grid = p[..., [2, 1, 0]].view(B, 1, 1, N, 3)
+        out = F.grid_sample(voxel, grid, mode="bilinear", padding_mode="border", align_corners=False)
+        return out.squeeze(2).squeeze(2).transpose(1, 2)
+
+    def forward(self, x, pos01):
+        v0 = self._voxelize(x, pos01)
+        e1 = self.enc1(v0)
+        e2 = self.enc2(self.pool(e1))
+        e3 = self.enc3(self.pool(e2))
+        u2 = F.interpolate(e3, size=e2.shape[-3:], mode="trilinear", align_corners=False)
+        d2 = self.dec2(torch.cat([u2, e2], dim=1))
+        u1 = F.interpolate(d2, size=e1.shape[-3:], mode="trilinear", align_corners=False)
+        d1 = self.dec1(torch.cat([u1, e1], dim=1))
+        return self._devoxelize(self.out(d1), pos01)
+
+
+class _ResMLP(nn.Module):
+    def __init__(self, d, mult=2):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(d),
+            nn.Linear(d, d * mult),
+            nn.GELU(),
+            nn.Linear(d * mult, d),
+        )
 
     def forward(self, x):
-        e1 = self.enc1(x)
-        e2 = self.enc2(F.avg_pool3d(e1, 2))
-        e3 = self.enc3(F.avg_pool3d(e2, 2))
-        d2 = self.dec2(torch.cat(
-            [F.interpolate(e3, scale_factor=2, mode="trilinear", align_corners=False), e2], dim=1
-        ))
-        d1 = self.dec1(torch.cat(
-            [F.interpolate(d2, scale_factor=2, mode="trilinear", align_corners=False), e1], dim=1
-        ))
-        return self.out(d1)
+        return x + self.net(x)
 
 
-class VoxelSpatial(nn.Module):
-    def __init__(self, dim, res=64, unet_mid=64, pad=0.05):
+class _VoxelUNetModel(nn.Module):
+    def __init__(self, hidden=256, num_pre=2, num_post=4,
+                 grid=(64, 32, 32), ch_base=64,
+                 num_pos_freqs=10, num_vel_freqs=3, num_dist_freqs=6):
         super().__init__()
-        self.res = res
-        self.pad = pad
-        self.unet = UNet3D(c_in=dim, c_mid=unet_mid, c_out=dim)
-        nn.init.zeros_(self.unet.out.weight)
-        nn.init.zeros_(self.unet.out.bias)
+        pos_dim = 3 * (1 + 2 * num_pos_freqs)
+        vin_dim = T_IN * 3
+        vin_fourier_dim = 3 * 2 * num_vel_freqs
+        dist_dim = 2 + 2 * num_dist_freqs
+        in_dim = pos_dim + vin_dim + vin_fourier_dim + dist_dim + 1
 
-    def forward(self, feats, pos):
-        B, N, D = feats.shape
-        R = self.res
-        lo = pos.amin(dim=1, keepdim=True) - self.pad
-        hi = pos.amax(dim=1, keepdim=True) + self.pad
-        p01 = (pos - lo) / (hi - lo).clamp(min=1e-6)
-        idx = (p01 * R).long().clamp(0, R - 1)
-        flat = idx[..., 0] * R * R + idx[..., 1] * R + idx[..., 2]
+        self.num_pos_freqs = num_pos_freqs
+        self.num_vel_freqs = num_vel_freqs
+        self.num_dist_freqs = num_dist_freqs
 
-        vox = feats.new_zeros(B, D, R * R * R)
-        cnt = feats.new_zeros(B, 1, R * R * R)
-        vox.scatter_add_(2, flat.unsqueeze(1).expand(-1, D, -1), feats.transpose(1, 2))
-        cnt.scatter_add_(2, flat.unsqueeze(1),
-                         torch.ones_like(flat, dtype=feats.dtype).unsqueeze(1))
-        vox = vox / cnt.clamp(min=1.0)
-        vox = vox.view(B, D, R, R, R)
-
-        vox = self.unet(vox)
-
-        grid = (p01 * 2 - 1)[:, None, None, :, [2, 1, 0]]
-        sampled = F.grid_sample(vox, grid, mode="bilinear",
-                                align_corners=False, padding_mode="border")
-        sampled = sampled.squeeze(2).squeeze(2).transpose(1, 2)
-        return feats + sampled
-
-
-class VoxelResidualModel(nn.Module):
-    def __init__(self, hidden=256, voxel_res=64, voxel_mid=64,
-                 n_blocks_pre=2, n_blocks_post=4):
-        super().__init__()
-        in_dim = T_IN * 3 + 3 + 1 + 2
-        out_dim = T_OUT * 3
         self.proj_in = nn.Linear(in_dim, hidden)
-        self.blocks_pre = nn.Sequential(*[ResBlock(hidden) for _ in range(n_blocks_pre)])
-        self.spatial = VoxelSpatial(dim=hidden, res=voxel_res, unet_mid=voxel_mid)
-        self.blocks_post = nn.Sequential(*[ResBlock(hidden) for _ in range(n_blocks_post)])
+        self.blocks_pre = nn.ModuleList([_ResMLP(hidden) for _ in range(num_pre)])
+        self.unet = _VoxelUNet(hidden, grid=grid, ch_base=ch_base)
+        self.blocks_post = nn.ModuleList([_ResMLP(hidden) for _ in range(num_post)])
         self.norm_out = nn.LayerNorm(hidden)
-        self.proj_out = nn.Linear(hidden, out_dim)
-        nn.init.zeros_(self.proj_out.weight)
-        nn.init.zeros_(self.proj_out.bias)
+        self.proj_out = nn.Linear(hidden, T_OUT * 3)
+
         self.register_buffer("vel_mean", torch.zeros(1, 1, 1, 3))
         self.register_buffer("vel_std", torch.ones(1, 1, 1, 3))
+        self.register_buffer("domain_min", DOMAIN_MIN.view(1, 1, 3))
+        self.register_buffer("domain_max", DOMAIN_MAX.view(1, 1, 3))
 
-    def forward(self, velocity_in, pos, idcs_airfoil, sdf):
+    def forward(self, velocity_in, pos, idcs_airfoil, dist_airfoil):
         B, T, N, C = velocity_in.shape
+        last_v = velocity_in[:, -1]
         v_norm = (velocity_in - self.vel_mean) / self.vel_std
-        v_feat = v_norm.permute(0, 2, 1, 3).reshape(B, N, T * C)
 
-        mask = torch.zeros(B, N, 1, device=velocity_in.device, dtype=velocity_in.dtype)
-        for b, idcs in enumerate(idcs_airfoil):
-            mask[b, idcs.to(mask.device), 0] = 1.0
+        pos_feat = _fourier(pos, self.num_pos_freqs)
+        vin_flat = v_norm.permute(0, 2, 1, 3).reshape(B, N, T_IN * 3)
+        last_norm = v_norm[:, -1]
+        vfreqs = 2.0 ** torch.arange(self.num_vel_freqs, device=pos.device, dtype=pos.dtype) * math.pi
+        vf = last_norm.unsqueeze(-1) * vfreqs
+        vin_fourier = torch.cat([vf.sin(), vf.cos()], dim=-1).reshape(B, N, -1)
 
-        sdf_raw = (sdf / 5.0).unsqueeze(-1)
-        sdf_log = torch.log1p(sdf).unsqueeze(-1)
+        airfoil_ind = torch.zeros(B, N, 1, device=pos.device, dtype=pos.dtype)
+        for b, idx in enumerate(idcs_airfoil):
+            airfoil_ind[b, idx.to(pos.device).long(), 0] = 1.0
 
-        x = torch.cat([v_feat, pos, mask, sdf_raw, sdf_log], dim=-1)
-        x = self.proj_in(x)
-        x = self.blocks_pre(x)
-        x = self.spatial(x, pos)
-        x = self.blocks_post(x)
-        x = self.norm_out(x)
-        delta_norm = self.proj_out(x).reshape(B, N, T_OUT, 3).permute(0, 2, 1, 3)
+        d = dist_airfoil.unsqueeze(-1)
+        d_log = torch.log1p(d)
+        dfreqs = 2.0 ** torch.arange(self.num_dist_freqs, device=pos.device, dtype=pos.dtype) * math.pi
+        df = d_log * dfreqs
+        d_feat = torch.cat([d, d_log, df.sin(), df.cos()], dim=-1)
+
+        feat = torch.cat([pos_feat, vin_flat, vin_fourier, d_feat, airfoil_ind], dim=-1)
+        h = self.proj_in(feat)
+        for blk in self.blocks_pre:
+            h = blk(h)
+
+        pos01 = (pos - self.domain_min) / (self.domain_max - self.domain_min)
+        h = h + self.unet(h, pos01)
+
+        for blk in self.blocks_post:
+            h = blk(h)
+
+        h = self.norm_out(h)
+        delta_norm = self.proj_out(h).reshape(B, N, T_OUT, 3).permute(0, 2, 1, 3)
         delta = delta_norm * self.vel_std
+        pred = last_v.unsqueeze(1) + delta
 
-        last_frame = velocity_in[:, -1:].expand(-1, T_OUT, -1, -1)
-        pred = last_frame + delta
+        for b, idx in enumerate(idcs_airfoil):
+            pred[b, :, idx.to(pred.device).long(), :] = 0.0
 
-        no_slip = torch.ones(B, 1, N, 1, device=pred.device, dtype=pred.dtype)
-        for b, idcs in enumerate(idcs_airfoil):
-            no_slip[b, 0, idcs.to(no_slip.device), 0] = 0.0
-        return pred * no_slip
+        return pred
+
+
+def _build_and_load(ckpt_path):
+    sd = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    ch_base = sd["unet.enc1.block.0.weight"].shape[0]
+    m = _VoxelUNetModel(hidden=256, num_pre=2, num_post=4,
+                        grid=(64, 32, 32), ch_base=ch_base)
+    m.load_state_dict(sd)
+    return m
 
 
 class Model(nn.Module):
-    """Entry point with the competition signature.
+    """Signature: (t, pos, idcs_airfoil, velocity_in) -> velocity_out."""
 
-    Computes the per-sample SDF (wall distance) on the fly since the signature
-    does not receive it, then delegates to the voxel-UNet residual model.
-    """
+    _WEIGHTS = (0.325 / 0.675, 0.35 / 0.675)
 
     def __init__(self):
         super().__init__()
-        self.net = VoxelResidualModel(
-            hidden=256, voxel_res=64, voxel_mid=64,
-            n_blocks_pre=2, n_blocks_post=4,
-        )
-        state_dict = torch.load(
-            os.path.join("models", "kagent", "state_dict.pt"),
-            map_location="cpu",
-        )
-        self.net.load_state_dict(state_dict)
+        here = os.path.join("models", "kagent")
+        self.members = nn.ModuleList([
+            _build_and_load(os.path.join(here, "state_dict_1.pt")),
+            _build_and_load(os.path.join(here, "state_dict_2.pt")),
+        ])
 
     def forward(
         self,
         t: torch.Tensor,
         pos: torch.Tensor,
-        idcs_airfoil: list[torch.Tensor],
+        idcs_airfoil: list,
         velocity_in: torch.Tensor,
     ) -> torch.Tensor:
-        B = pos.shape[0]
-        sdf = torch.stack([_compute_sdf(pos[b], idcs_airfoil[b]) for b in range(B)])
-        return self.net(velocity_in, pos, idcs_airfoil, sdf)
+        dist = _compute_dist(pos, idcs_airfoil)
+
+        pos_f = pos.clone()
+        pos_f[..., 1] = -pos_f[..., 1]
+        v_f = velocity_in.clone()
+        v_f[..., 1] = -v_f[..., 1]
+        dist_f = _compute_dist(pos_f, idcs_airfoil)
+
+        agg = None
+        for m, w in zip(self.members, self._WEIGHTS):
+            out_d = m(velocity_in, pos, idcs_airfoil, dist)
+            out_f = m(v_f, pos_f, idcs_airfoil, dist_f)
+            out_f = out_f.clone()
+            out_f[..., 1] = -out_f[..., 1]
+            avg = 0.5 * (out_d + out_f)
+            agg = avg * w if agg is None else agg + avg * w
+        return agg
