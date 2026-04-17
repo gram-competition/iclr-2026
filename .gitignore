@@ -1,6 +1,5 @@
 /gram_data
 /venv/*
-*.pt
 *.pyc
 *.gif
 events.*
