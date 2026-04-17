@@ -1,6 +1,7 @@
 # TransolverResidual — GRaM 2026 Submission
 
 This is our submission for the GRaM challenge at ICLR 2026.
+Authors: Mikel Mendibe, Ivan Bioli, Massimiliano Ghiotto.
 
 **Task:** Predict 5 future velocity field timesteps from 5 input timesteps on irregular
 3D point clouds (~100k points) around F1-style airfoil geometries.
@@ -83,6 +84,9 @@ cost (~5–10 seconds for 100k points on CPU).  Subsequent calls on the same geo
 
 The model is fully self-contained: no external config files are required.
 `TransolverResidual()` instantiates with trained weights loaded automatically.
+
+## Disclaimer
+A good part of the code was either written or re-written with the assitance of LLMs. Not really happy about it, but the deadline was tight, and hey, we had to make some sacrifices.
 
 ---
 
