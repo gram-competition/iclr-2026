@@ -228,11 +228,7 @@ class FNO_DSE_TIME(nn.Module):
     def __init__(self):
         super().__init__()
         self.model = FNO3d_dse_v2(FNO3d_dse_v2.configs)
-        checkpoint_path = os.path.join(
-            os.path.dirname(__file__),
-            '..', '..', '..', '..',
-            'output', '20260413-005251_fno_dse_time', 'checkpoints', 'best.pt'
-        )
+        checkpoint_path = 'models/fno_dse_time/best.pt'
         state = torch.load(os.path.abspath(checkpoint_path), map_location='cpu', weights_only=True)
         if 'model' in state:
             state = state['model']
