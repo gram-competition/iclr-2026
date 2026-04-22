@@ -4,14 +4,8 @@
 
 The final submission entrypoint is `Model()` in `models/smoothsplatnet/model.py`.
 It can be instantiated without arguments, loads all weights during construction,
-and performs an equal-weight ensemble over three checkpoints:
+and performs an equal-weight ensemble over three checkpoints.
 
-- `state_dict_seed52.pt`
-- `state_dict_seed57.pt`
-- `state_dict_seed85.pt`
-
-No test-time augmentation is used in the final submission. The wrapper runs one
-raw forward pass per member and averages the three predictions.
 
 ## Backbone Summary
 
@@ -36,8 +30,7 @@ Each ensemble member uses the same standalone backbone implemented in
 
 ## Training Recipe
 
-- Optimizer: `AdamW`
-- Optimizer reference: [8]
+- Optimizer: `AdamW`[8]
 - Peak learning rate: `3e-4`
 - Weight decay: `1e-5`
 - Learning-rate schedule: `3` warmup epochs followed by cosine decay
