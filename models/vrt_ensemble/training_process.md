@@ -145,24 +145,24 @@ for memory safety.
 Pre- and post-routing stages use `PointwiseSwiGLUBlock`, which is a
 parameter-efficient residual MLP block with multiplicative gating.
 
-For an input point feature \(x \in \mathbb{R}^{D}\), the block computes:
+For an input point feature $x \in \mathbb{R}^{D}$, the block computes:
 
-\[
+```math
 \tilde{x} = \mathrm{LN}(x)
-\]
-\[
+```
+```math
 g = \mathrm{SiLU}(W_g \tilde{x}), \quad u = W_u \tilde{x}
-\]
-\[
+```
+```math
 y = x + W_o (g \odot u)
-\]
+```
 
 where:
 
-- \(W_g, W_u \in \mathbb{R}^{D \times H}\)
-- \(W_o \in \mathbb{R}^{H \times D}\)
-- \(H = \left\lceil \frac{8}{3}D \right\rceil\) rounded to even
-- \(\odot\) is elementwise multiplication
+- $W_g, W_u \in \mathbb{R}^{D \times H}$
+- $W_o \in \mathbb{R}^{H \times D}$
+- $H = \left\lceil \frac{8}{3}D \right\rceil$ rounded to even
+- $\odot$ is elementwise multiplication
 
 Key properties:
 
@@ -207,21 +207,21 @@ Skip connections are additive (not concat), reducing memory pressure.
 
 #### 3.4.1 Scatter to lattice
 
-Let normalized coordinates be \(c_i = (x_i, y_i, z_i)\in [0,1)^3\).
+Let normalized coordinates be $c_i = (x_i, y_i, z_i)\in [0,1)^3$.
 Each point is assigned to a voxel index:
 
-\[
+```math
 v_i = \lfloor x_i G_x \rfloor (G_y G_z) + \lfloor y_i G_y \rfloor G_z + \lfloor z_i G_z \rfloor
-\]
+```
 
-For feature \(f_i \in \mathbb{R}^{D}\), lattice aggregation uses `scatter_add`
+For feature $f_i \in \mathbb{R}^{D}$, lattice aggregation uses `scatter_add`
 for both summed features and counts, then computes voxel averages:
 
-\[
+```math
 F_v = \frac{\sum_{i: v_i=v} f_i}{\max(1, n_v)}
-\]
+```
 
-This gives a dense tensor \(F \in \mathbb{R}^{B \times D \times G_x \times G_y \times G_z}\).
+This gives a dense tensor $F \in \mathbb{R}^{B \times D \times G_x \times G_y \times G_z}$.
 
 #### 3.4.2 ConvNeXt-V2 3D block details
 
@@ -237,12 +237,12 @@ Each 3D block uses:
 
 GRN normalizes channel responses using global spatial norms:
 
-\[
+```math
 g = \|x\|_{2,\text{spatial}}, \quad n = \frac{g}{\mathrm{mean}_c(g)+\epsilon}
-\]
-\[
+```
+```math
 \mathrm{GRN}(x)=\gamma(x\odot n)+\beta+x
-\]
+```
 
 This encourages competition/cooperation between channels and improves stability
 for deep ConvNeXt-style stacks.
@@ -303,14 +303,14 @@ During inference, each member loads its own stats file before prediction.
 
 VRT uses a weighted composite objective:
 
-\[
+```math
 \mathcal{L}
 = \alpha \cdot \mathcal{L}_{mse}
 + \beta \cdot \mathcal{L}_{l1}
 + \gamma \cdot \mathcal{L}_{temp}
 + \delta \cdot \mathcal{L}_{airfoil} \cdot w_{airfoil}
 + \lambda_{grad} \cdot \mathcal{L}_{gmse}
-\]
+```
 
 Where:
 
@@ -322,17 +322,17 @@ Where:
 
 ### 5.1 Explicit per-term definitions
 
-Let prediction and target be \( \hat{u}, u \in \mathbb{R}^{B \times T \times N \times 3} \).
+Let prediction and target be $ \hat{u}, u \in \mathbb{R}^{B \times T \times N \times 3} $.
 
 #### (a) Reconstruction MSE
-\[
+```math
 \mathcal{L}_{mse}=\frac{1}{BTN3}\sum_{b,t,n,c}(\hat{u}_{btnc}-u_{btnc})^2
-\]
+```
 
 #### (b) Reconstruction L1
-\[
+```math
 \mathcal{L}_{l1}=\frac{1}{BTN3}\sum_{b,t,n,c}\left|\hat{u}_{btnc}-u_{btnc}\right|
-\]
+```
 
 L1 adds robustness to outliers and sharp local deviations that MSE alone may
 over-smooth.
@@ -340,23 +340,23 @@ over-smooth.
 #### (c) Temporal consistency term
 
 Define frame-to-frame deltas:
-\[
+```math
 \Delta \hat{u}_{b,t}=\hat{u}_{b,t+1}-\hat{u}_{b,t}, \quad
 \Delta u_{b,t}=u_{b,t+1}-u_{b,t}
-\]
-\[
+```
+```math
 \mathcal{L}_{temp}=\mathrm{MSE}(\Delta \hat{u}, \Delta u)
-\]
+```
 
 This directly regularizes rollout dynamics, not just absolute frame values.
 
 #### (d) Airfoil no-slip penalty
 
-For boundary index set \(\mathcal{A}_b\):
-\[
+For boundary index set $\mathcal{A}_b$:
+```math
 \mathcal{L}_{airfoil}=
 \frac{1}{B}\sum_b \mathrm{mean}_{t,n\in\mathcal{A}_b,c}\left(\hat{u}_{btnc}^2\right)
-\]
+```
 
 This pushes boundary velocity toward zero even when reconstruction terms alone
 could tolerate small slip.
@@ -364,15 +364,15 @@ could tolerate small slip.
 #### (e) Gradient MSE (GMSE)
 
 Using finite differences along point dimension:
-\[
+```math
 \nabla_n \hat{u}_{b,t,n,c}=\hat{u}_{b,t,n+1,c}-\hat{u}_{b,t,n,c}
-\]
-\[
+```
+```math
 \nabla_n u_{b,t,n,c}=u_{b,t,n+1,c}-u_{b,t,n,c}
-\]
-\[
+```
+```math
 \mathcal{L}_{gmse}=\mathrm{MSE}(\nabla_n \hat{u}, \nabla_n u)
-\]
+```
 
 GMSE constrains local variation patterns and combats over-smoothing in high
 gradient regions.
@@ -392,17 +392,17 @@ physics, and local sharpness.
 
 With configured coefficients:
 
-\[
+```math
 \mathcal{L}
 =1.0\,\mathcal{L}_{mse}
 +0.1\,\mathcal{L}_{l1}
 +0.5\,\mathcal{L}_{temp}
 +(0.2\times 5.0)\,\mathcal{L}_{airfoil}
 +0.5\,\mathcal{L}_{gmse}
-\]
+```
 
 So the effective airfoil multiplier is `1.0` relative to raw
-\(\mathcal{L}_{airfoil}\).
+$\mathcal{L}_{airfoil}$.
 
 Training weights (from run logs):
 
@@ -497,98 +497,98 @@ These values are aggregated from the training records of the four selected membe
 
 ## 11) Evaluation metrics and final benchmark results
 
-Let \(\hat{u}, u \in \mathbb{R}^{B\times T\times N\times 3}\) be prediction and
-ground truth, and \(u^{persist}\) be persistence baseline (repeat last input
-frame). For sample index \(b\), timestep \(t\), point \(n\):
+Let $\hat{u}, u \in \mathbb{R}^{B\times T\times N\times 3}$ be prediction and
+ground truth, and $u^{persist}$ be persistence baseline (repeat last input
+frame). For sample index $b$, timestep $t$, point $n$:
 
 ### 11.1 Primary evaluation metrics
 
 **Relative L2 error**
-\[
+```math
 \mathrm{RelL2}
 = \frac{1}{B}\sum_b
 \frac{\|\hat{u}_b-u_b\|_2}{\|u_b\|_2+\epsilon}
-\]
-where norms are over all flattened \((T,N,3)\) elements.
+```
+where norms are over all flattened $(T,N,3)$ elements.
 
 **Temporal rollout error**
-\[
+```math
 \mathrm{Rollout}
 = \frac{1}{B}\sum_b \frac{1}{T}\sum_t
 \frac{\|\hat{u}_{b,t}-u_{b,t}\|_2}{\|u_{b,t}\|_2+\epsilon}
-\]
+```
 
 **High-frequency residual L2**
-\[
+```math
 \bar{u}_b=\frac{1}{T}\sum_t u_{b,t},\quad
 \bar{\hat{u}}_b=\frac{1}{T}\sum_t \hat{u}_{b,t}
-\]
-\[
+```
+```math
 \mathrm{HFRes}
 = \frac{1}{B}\sum_b
 \frac{\|(\hat{u}_b-\bar{\hat{u}}_b)-(u_b-\bar{u}_b)\|_2}
 {\|u_b-\bar{u}_b\|_2+\epsilon}
-\]
+```
 
 **Boundary condition error**
-\[
+```math
 \mathrm{BCE}
 = \frac{1}{B}\sum_b
 \sqrt{
 \frac{1}{T|\mathcal{A}_b|}
 \sum_{t}\sum_{n\in\mathcal{A}_b}\|\hat{u}_{b,t,n}\|_2^2 + \epsilon
 }
-\]
-where \(\mathcal{A}_b\) is the airfoil/boundary index set.
+```
+where $\mathcal{A}_b$ is the airfoil/boundary index set.
 
 ### 11.2 Training-log style auxiliary metrics
 
 **L2 (competition metric)**
-\[
+```math
 \mathrm{L2}
 = \frac{1}{B}\sum_b \frac{1}{TN}\sum_{t,n}\|\hat{u}_{b,t,n}-u_{b,t,n}\|_2
-\]
+```
 
 **L1**
-\[
+```math
 \mathrm{L1}
 = \frac{1}{BTN3}\sum_{b,t,n,c}|\hat{u}_{btnc}-u_{btnc}|
-\]
+```
 
 **MSE**
-\[
+```math
 \mathrm{MSE}
 = \frac{1}{BTN3}\sum_{b,t,n,c}(\hat{u}_{btnc}-u_{btnc})^2
-\]
+```
 
 **GMSE**
-\[
+```math
 \mathrm{GMSE}
 = \mathrm{MSE}\!\left(
 (\hat{u}_{:,:,1:,:}-\hat{u}_{:,:,:-1,:}),
 (u_{:,:,1:,:}-u_{:,:,:-1,:})
 \right)
-\]
+```
 
 **Weighted L2 and vs\_persist**
 
 Define point weights from persistence innovation:
-\[
+```math
 \Delta_{b,n}=\frac{1}{T}\sum_t\|u_{b,t,n}-u^{persist}_{b,t,n}\|_2,\quad
 w_{b,n}=\frac{\Delta_{b,n}+\epsilon}{\sum_n(\Delta_{b,n}+\epsilon)}
-\]
+```
 
 Then:
-\[
+```math
 \mathrm{wL2}_b = \frac{1}{T}\sum_t\sum_n w_{b,n}\|\hat{u}_{b,t,n}-u_{b,t,n}\|_2
-\]
-\[
+```
+```math
 \mathrm{pL2}_b = \frac{1}{T}\sum_t\sum_n w_{b,n}\|u^{persist}_{b,t,n}-u_{b,t,n}\|_2
-\]
-\[
+```
+```math
 \mathrm{weighted\_l2}=\frac{1}{B}\sum_b \mathrm{wL2}_b,\quad
 \mathrm{vs\_persist}=\frac{1}{B}\sum_b\frac{\mathrm{wL2}_b}{\mathrm{pL2}_b+\epsilon}
-\]
+```
 
 Final reported mean results for this submission (mean over the evaluation set):
 
