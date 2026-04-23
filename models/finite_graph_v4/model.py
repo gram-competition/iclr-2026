@@ -52,7 +52,7 @@ class FiniteGraphV4(nn.Module):
                 f"before instantiating the model."
             )
 
-        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
         cfg = ckpt.get("model_config", {})
         self.inner = FiniteGraphModelV4(**cfg)
         self.inner.load_state_dict(ckpt["state_dict"])
