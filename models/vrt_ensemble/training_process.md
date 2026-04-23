@@ -605,7 +605,7 @@ Final reported mean results for this submission (mean over the evaluation set):
 
 ---
 
-## 12) Final submitted model (clear statement)
+## 12) Final submitted model 
 
 The submission is a **composite inference system**, not a single network:
 
