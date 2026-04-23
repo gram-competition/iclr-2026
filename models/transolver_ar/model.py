@@ -223,7 +223,7 @@ class TransolverAR(nn.Module):
         sd = torch.load(root / "state_dict.pt", map_location="cpu", weights_only=True)
         self._inner.load_state_dict(sd)
 
-        ns = torch.load(root / "norm_stats.pt", map_location="cpu", weights_only=False)
+        ns = torch.load(root / "norm_stats.pt", map_location="cpu", weights_only=True)
         self.register_buffer("pos_mean", ns["pos_mean"])  # (3,)
         self.register_buffer("pos_std",  ns["pos_std"])
         self.register_buffer("vel_mean", ns["vel_mean"])
