@@ -376,7 +376,7 @@ class VolumetricRoutingTransformer(nn.Module):
 
     @torch.no_grad()
     def load_flow_stats(self, stats_path: str) -> None:
-        payload = torch.load(stats_path, map_location="cpu", weights_only=False)
+        payload = torch.load(stats_path, map_location="cpu", weights_only=True)
         if not isinstance(payload, dict):
             raise ValueError(f"Invalid flow-stats file (expected dict): {stats_path}")
         if "flow_channel_mean" in payload and "flow_channel_scale" in payload:
