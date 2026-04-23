@@ -174,10 +174,16 @@ def evaluate(
     assert_no_slip: bool = False,
     use_sobolev: bool = False,
     wall_distance_loss_alpha: float = 0.0,
-) -> tuple[float, float, float]:
+) -> tuple[float, float, float, float, float]:
+    """Returns (mean RL2 scaled, mean HINT unscaled, 0.0 placeholder, persistence RL2, persistence HINT).
+
+    Persistence = repeat last input velocity frame for all output timesteps (same spaces as model).
+    """
     model.eval()
     total_loss = 0.0
     total_metric = 0.0
+    total_persist_loss = 0.0
+    total_persist_metric = 0.0
     with torch.no_grad():
         for batch in loader:
             (
@@ -219,6 +225,21 @@ def evaluate(
                 else:
                     loss = loss_fn(pred_scaled, velocity_out, wall_weights=wall_weights)
 
+            persist_pred = velocity_in[:, -1:, :, :].expand_as(velocity_out)
+            if use_sobolev:
+                p_loss = loss_fn(
+                    persist_pred,
+                    velocity_out,
+                    knn_indices=knn_indices,
+                    pos=pos,
+                    wall_weights=wall_weights,
+                )
+            else:
+                p_loss = loss_fn(
+                    persist_pred, velocity_out, wall_weights=wall_weights
+                )
+            total_persist_loss += p_loss.item()
+
             if assert_no_slip:
                 assert_no_slip_boundary(
                     pred_scaled,
@@ -242,8 +263,23 @@ def evaluate(
                 velocity_std,
             )
             total_metric += hint_metric(pred_unscaled, target_unscaled).item()
+
+            persist_unscaled = unscale_velocity_batch(
+                persist_pred.float(),
+                velocity_mean,
+                velocity_std,
+            )
+            total_persist_metric += hint_metric(
+                persist_unscaled, target_unscaled
+            ).item()
     denom = max(1, len(loader))
-    return total_loss / denom, total_metric / denom, 0.0
+    return (
+        total_loss / denom,
+        total_metric / denom,
+        0.0,
+        total_persist_loss / denom,
+        total_persist_metric / denom,
+    )
 
 
 def run_full_test_inference(
@@ -267,7 +303,7 @@ def run_full_test_inference(
     precompute_knn: bool = False,
     knn_cache_dir: str | Path | None = None,
     knn_k: int = 16,
-) -> tuple[float, float, float]:
+) -> tuple[float, float, float, float, float]:
     test_dataset = WarpedIFWDataset(
         test_files,
         num_points=num_points,

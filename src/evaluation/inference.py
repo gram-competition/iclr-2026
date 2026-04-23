@@ -388,7 +388,13 @@ def evaluate_checkpoint(args: argparse.Namespace) -> tuple[float, float, float]:
 
     loss_fn = RelativeL2Loss()
 
-    eval_loss, eval_metric, _ = evaluate(
+    (
+        eval_loss,
+        eval_metric,
+        _,
+        persist_rl2,
+        persist_hint,
+    ) = evaluate(
         model,
         loader,
         loss_fn,
@@ -407,6 +413,14 @@ def evaluate_checkpoint(args: argparse.Namespace) -> tuple[float, float, float]:
     print(f"Checkpoint: {checkpoint_path}")
     print(f"Eval RL2 (scaled): {eval_loss:.6f}")
     print(f"Eval HINT (unscaled): {eval_metric:.6f}")
+    print(
+        f"Persistence RL2 (scaled, last-frame repeat): {persist_rl2:.6f} | "
+        f"lower is better; model wins if eval < persistence"
+    )
+    print(
+        f"Persistence HINT (unscaled): {persist_hint:.6f} | "
+        f"lower is better; model wins if eval < persistence"
+    )
 
     return eval_loss, eval_metric, 0.0
 

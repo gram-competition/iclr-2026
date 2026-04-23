@@ -721,7 +721,7 @@ def train(args: argparse.Namespace) -> None:
                 dist.barrier()
             resumed_val_metric = 0.0
             if rank == 0:
-                _, resumed_val_metric, _ = evaluate(
+                _, resumed_val_metric, _, _, _ = evaluate(
                     _eval_module(model),
                     val_loader,
                     loss_fn,
@@ -950,7 +950,7 @@ def train(args: argparse.Namespace) -> None:
             avg_val_loss = 0.0
             avg_val_metric = 0.0
             if rank == 0:
-                avg_val_loss, avg_val_metric, _ = evaluate(
+                avg_val_loss, avg_val_metric, _, _, _ = evaluate(
                     _eval_module(model),
                     val_loader,
                     loss_fn,
@@ -1089,7 +1089,7 @@ def train(args: argparse.Namespace) -> None:
             best_checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
             _load_model_state_from_checkpoint(model, best_checkpoint)
             if test_files:
-                test_loss, test_metric, _ = run_full_test_inference(
+                test_loss, test_metric, _, p_rl2, p_hint = run_full_test_inference(
                     _eval_module(model),
                     test_files,
                     loss_fn,
@@ -1113,7 +1113,9 @@ def train(args: argparse.Namespace) -> None:
                 print(
                     "Full test inference complete | "
                     f"test_rl2_scaled={test_loss:.6f} | "
-                    f"test_hint_unscaled={test_metric:.6f}"
+                    f"test_hint_unscaled={test_metric:.6f} | "
+                    f"persist_rl2_scaled={p_rl2:.6f} | "
+                    f"persist_hint_unscaled={p_hint:.6f}"
                 )
             else:
                 print(
