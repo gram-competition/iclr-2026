@@ -24,6 +24,12 @@ from .backbones import build_backbone
 from .temporal import TemporalAttentionHead
 
 
+def _sanitize_airfoil_idx(idx: torch.Tensor, num_points: int, device: torch.device) -> torch.Tensor:
+    if idx.numel() == 0:
+        return idx.to(device=device, dtype=torch.long)
+    return idx.to(device=device, dtype=torch.long).clamp_(0, num_points - 1)
+
+
 def _timer_now(device: torch.device | str) -> float:
     if isinstance(device, str):
         use_cuda = device.startswith("cuda") and torch.cuda.is_available()
@@ -157,6 +163,7 @@ class SpatioTemporalGNN(nn.Module):
         device = pos.device
         timings: dict[str, float] = {}
         t_prev = _timer_now(device) if self.enable_timing else 0.0
+        airfoil_idx = _sanitize_airfoil_idx(airfoil_idx, N, device)
 
         # 1. airfoil mask
         mask = pos.new_zeros(N, 1)
@@ -245,9 +252,10 @@ class SpatioTemporalGNN(nn.Module):
         outputs = []
         totals: dict[str, float] = {}
         for b in range(B):
+            n_pts = pos[b].shape[0]
             out, timings = self._forward_single(
                 pos[b], velocity_in[b],
-                idcs_airfoil[b].to(pos.device),
+                _sanitize_airfoil_idx(idcs_airfoil[b], n_pts, pos.device),
             )
             outputs.append(out)
             if self.enable_timing:
