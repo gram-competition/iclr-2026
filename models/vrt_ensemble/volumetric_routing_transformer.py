@@ -1,620 +1,513 @@
-# Volumetric Routing Transformer (VRT): full technical description
-
-The name **Volumetric Routing Transformer (VRT)** reflects the three core ideas:
-
-- **Volumetric**: point-cloud features are projected to a structured 3D lattice
-  (volume) and processed with multi-scale 3D convolutional operators.
-- **Routing**: information is routed point -> lattice -> point, allowing global
-  spatial context exchange while keeping pointwise representation compatibility.
-- **Transformer**: pointwise token refinements use transformer-style residual
-  blocks with normalization and gated feed-forward mixing (SwiGLU-like blocks),
-  and temporal information is encoded in a token-centric manner.
-
-In short, VRT combines unstructured point processing with structured volumetric
-reasoning and transformer-style token updates.
-
-## Block diagram (architecture overview)
-
-```text
-Inputs
-  t (B,10), pos (B,N,3), idcs_airfoil, velocity_in (B,5,N,3)
-        |
-        v
-[Feature Builder]
-  - position Fourier features
-  - velocity history + spectral features
-  - boundary distance + direction features
-  - temporal velocity encoder
-  - boundary mask / flow stats
-        |
-        v
-[Linear Projection to Hidden Dim]
-        |
-        v
-[Pre Pointwise Blocks x3  <-- Transformer-style token blocks]
-  PointwiseSwiGLU residual refinement (LN + gated FFN + residual)
-        |
-        v
-[Volumetric Routing Core]
-  scatter points -> 3D lattice (64x32x32)
-        -> 3D ConvNeXt-V2 UNet (multi-scale)
-        -> sample lattice back to points
-        |
-        v
-[Post Pointwise Blocks x6]
-  pointwise residual refinement (same transformer-style token blocks)
-        |
-        v
-[LayerNorm + Delta Head]
-  predict 5x3 residual velocity channels per point
-        |
-        v
-[Residual Add from Last Input Frame]
-        |
-        v
-[No-slip Boundary Projection]
-  enforce zero velocity on airfoil indices
-        |
-        v
-Output
-  velocity_out (B,5,N,3)
-```
-
-This document describes the exact model family, training protocol, loss
-formulation, and final submission assembly used for the `submitted_vrt` entry.
-It is written as an implementation-level technical note suitable to reproduce
-the submission behavior end to end.
-
----
-
-## 1) Problem setting and tensor interface
-
-The model solves a spatiotemporal velocity forecasting task on 3D point clouds:
-
-- Input time grid: `T_in = 5` historical frames
-- Output horizon: `T_out = 5` future frames
-- Spatial points: `N = 100000` (full resolution)
-- Velocity channels: `C = 3`
-
-Expected callable signature (competition format):
-
-```python
-model(
-    t: Tensor[B, 10],
-    pos: Tensor[B, N, 3],
-    idcs_airfoil: list[Tensor[Mi]],
-    velocity_in: Tensor[B, 5, N, 3],
-) -> Tensor[B, 5, N, 3]
-```
-
-No-slip boundary condition is explicitly enforced on indices `idcs_airfoil`.
-
----
-
-## 2) Code locations
-
-This submission contains:
-
-- a single-member VRT architecture implementation,
-- an ensemble wrapper that combines four trained VRT members,
-- training-compatible loss definitions and normalization logic.
-
-The architecture and wrapper are self-contained in the submission package.
-
----
-
-## 3) Architecture (single VRT member)
-
-### 3.1 High-level decomposition
-
-Each forward pass is structured as:
-
-1. Build geometry- and dynamics-aware pointwise features
-2. Apply lightweight pointwise pre-routing blocks
-3. Route features through a structured volumetric lattice solver
-4. Apply post-routing pointwise refinement
-5. Decode residual future velocity and enforce physical boundary constraints
-
-This combines unstructured point-cloud inputs with structured 3D-grid operators.
-
-### 3.2 Input feature construction
-
-For each point, the feature stack includes:
-
-- **Position Fourier features** (`num_pos_freqs=10`)
-- **Flattened velocity history** (`5 x 3 = 15`)
-- **Last-frame velocity spectral features** (`num_vel_freqs=4`)
-- **Temporal encoder features** from a 1D conv stack over time
-- **Boundary geometry features**:
-  - nearest-surface distance
-  - `log1p(distance)`
-  - per-sample normalized distance
-  - inverse distance
-  - Fourier encoding of `log1p(distance)` (`num_dist_freqs=8`)
-  - unit direction vector to nearest boundary point
-- **Flow statistics features**:
-  - per-point mean speed over input frames
-  - per-point std speed over input frames
-- **Boundary mask**
-
-Nearest-boundary geometry is computed by chunked `torch.cdist` over surface points
-for memory safety.
-
-### 3.3 Pointwise blocks (pre/post routing)
-
-Pre- and post-routing stages use `PointwiseSwiGLUBlock`, which is a
-parameter-efficient residual MLP block with multiplicative gating.
-
-For an input point feature $x \in \mathbb{R}^{D}$, the block computes:
-
-$$
-\tilde{x} = \mathrm{LN}(x)
-$$
-$$
-g = \mathrm{SiLU}(W_g \tilde{x}), \quad u = W_u \tilde{x}
-$$
-$$
-y = x + W_o (g \odot u)
-$$
-
-where:
-
-- $W_g, W_u \in \mathbb{R}^{D \times H}$
-- $W_o \in \mathbb{R}^{H \times D}$
-- $H = \left\lceil \frac{8}{3}D \right\rceil$ rounded to even
-- $\odot$ is elementwise multiplication
-
-Key properties:
-
-- **Token-local transformation**: no explicit pairwise attention in this block
-  itself, keeping per-point cost low.
-- **Gated nonlinearity**: `SiLU(gate) * up` improves expressivity vs plain MLP.
-- **Residual form**: stabilizes depth and preserves identity signal paths.
-- **Bias-free linear maps** in gate/up/down projections reduce parameter
-  overhead and often improve scaling behavior with LayerNorm.
-
-Role in the full architecture:
-
-- **Pre-routing blocks** (`3` blocks) refine local point descriptors before
-  lattice projection.
-- **Post-routing blocks** (`6` blocks) re-mix routed features after lattice
-  globalization, acting as high-capacity pointwise correctors.
-
-Configured in training runs as:
-
-- pre blocks: `3`
-- post blocks: `6`
-
-### 3.4 Volumetric routing core
-
-The core operator (`SOTAConvNeXtV2Lattice`) is a structured 3D backbone that
-maps unordered point tokens to a Cartesian latent volume, processes that volume
-with ConvNeXt-V2-style blocks, then maps back to points.
-
-It performs:
-
-1. **Scatter** point features to a fixed Cartesian lattice
-2. **3D ConvNeXt-V2-style UNet** over lattice tensor
-3. **Sample back** lattice features to points via trilinear `grid_sample`
-
-Grid and channels used in final training:
-
-- grid resolution: `64 x 32 x 32`
-- base channels: `64`
-- multi-scale channel pyramid: `64, 128, 256, 512`
-
-Skip connections are additive (not concat), reducing memory pressure.
-
-#### 3.4.1 Scatter to lattice
-
-Let normalized coordinates be $c_i = (x_i, y_i, z_i)\in [0,1)^3$.
-Each point is assigned to a voxel index:
-
-$$
-v_i = \lfloor x_i G_x \rfloor (G_y G_z) + \lfloor y_i G_y \rfloor G_z + \lfloor z_i G_z \rfloor
-$$
-
-For feature $f_i \in \mathbb{R}^{D}$, lattice aggregation uses `scatter_add`
-for both summed features and counts, then computes voxel averages:
-
-$$
-F_v = \frac{\sum_{i: v_i=v} f_i}{\max(1, n_v)}
-$$
-
-This gives a dense tensor $F \in \mathbb{R}^{B \times D \times G_x \times G_y \times G_z}$.
-
-#### 3.4.2 ConvNeXt-V2 3D block details
-
-Each 3D block uses:
-
-1. depthwise `Conv3d(kernel=7, groups=channels)` (spatial mixing at low FLOPs),
-2. channel-last LayerNorm,
-3. pointwise expansion (`Linear(C, 4C)`),
-4. GELU,
-5. GRN (Global Response Normalization),
-6. pointwise contraction (`Linear(4C, C)`),
-7. residual connection.
-
-GRN normalizes channel responses using global spatial norms:
-
-$$
-g = \|x\|_{2,\text{spatial}}, \quad n = \frac{g}{\mathrm{mean}_c(g)+\epsilon}
-$$
-$$
-\mathrm{GRN}(x)=\gamma(x\odot n)+\beta+x
-$$
-
-This encourages competition/cooperation between channels and improves stability
-for deep ConvNeXt-style stacks.
-
-#### 3.4.3 Multi-scale UNet path
-
-The lattice backbone uses four scales:
-
-- Encoder:
-  - level1 (`C1=64`): 2 ConvNeXt-V2 blocks
-  - downsample to `C2=128`, 2 blocks
-  - downsample to `C3=256`, 2 blocks
-  - downsample to `C4=512`
-- Bottleneck:
-  - 3 ConvNeXt-V2 blocks at `C4`
-- Decoder:
-  - transpose-conv upsample + **additive skip**
-  - 2 blocks at `C3`
-  - upsample + additive skip, 2 blocks at `C2`
-  - upsample + additive skip, 2 blocks at `C1`
-
-Additive skip design avoids channel doubling from concat, reducing memory and
-bandwidth cost while preserving hierarchical information flow.
-
-#### 3.4.4 Sample back to points
-
-The final lattice tensor is sampled at point locations using trilinear
-interpolation (`grid_sample`, border padding), producing routed point features
-aligned to original point ordering.
-
-### 3.5 Decoder and physical projection
-
-After routing/refinement:
-
-- `LayerNorm`
-- linear head predicts `3 * T_out` residual channels per point
-- reshape to `[B, T_out, N, 3]`
-- add residual to last observed input frame
-- enforce no-slip by zeroing predicted velocity on `idcs_airfoil`
-
----
-
-## 4) Normalization and statistics handling
-
-Each member stores external stats in `vrt_flow_stats.pt`:
-
-- `flow_channel_mean`
-- `flow_channel_scale`
-- `spatial_bounds_lo`
-- `spatial_bounds_hi`
-
-During training, these statistics are fit from the training split and saved.
-During inference, each member loads its own stats file before prediction.
-
----
-
-## 5) Loss formulation (training objective)
-
-VRT uses a weighted composite objective:
-
-$$
-\mathcal{L}
-= \alpha \cdot \mathcal{L}_{mse}
-+ \beta \cdot \mathcal{L}_{l1}
-+ \gamma \cdot \mathcal{L}_{temp}
-+ \delta \cdot \mathcal{L}_{airfoil} \cdot w_{airfoil}
-+ \lambda_{grad} \cdot \mathcal{L}_{gmse}
-$$
-
-Where:
-
-- `mse`: global reconstruction MSE
-- `l1`: global reconstruction L1
-- `temp`: consistency of temporal deltas between prediction and target
-- `airfoil`: mean squared velocity on airfoil points (no-slip pressure term)
-- `gmse`: MSE between spatial finite differences of prediction and target
-
-### 5.1 Explicit per-term definitions
-
-Let prediction and target be $ \hat{u}, u \in \mathbb{R}^{B \times T \times N \times 3} $.
-
-#### (a) Reconstruction MSE
-$$
-\mathcal{L}_{mse}=\frac{1}{BTN3}\sum_{b,t,n,c}(\hat{u}_{btnc}-u_{btnc})^2
-$$
-
-#### (b) Reconstruction L1
-$$
-\mathcal{L}_{l1}=\frac{1}{BTN3}\sum_{b,t,n,c}\left|\hat{u}_{btnc}-u_{btnc}\right|
-$$
-
-L1 adds robustness to outliers and sharp local deviations that MSE alone may
-over-smooth.
-
-#### (c) Temporal consistency term
-
-Define frame-to-frame deltas:
-$$
-\Delta \hat{u}_{b,t}=\hat{u}_{b,t+1}-\hat{u}_{b,t}, \quad
-\Delta u_{b,t}=u_{b,t+1}-u_{b,t}
-$$
-$$
-\mathcal{L}_{temp}=\mathrm{MSE}(\Delta \hat{u}, \Delta u)
-$$
-
-This directly regularizes rollout dynamics, not just absolute frame values.
-
-#### (d) Airfoil no-slip penalty
-
-For boundary index set $\mathcal{A}_b$:
-$$
-\mathcal{L}_{airfoil}=
-\frac{1}{B}\sum_b \mathrm{mean}_{t,n\in\mathcal{A}_b,c}\left(\hat{u}_{btnc}^2\right)
-$$
-
-This pushes boundary velocity toward zero even when reconstruction terms alone
-could tolerate small slip.
-
-#### (e) Gradient MSE (GMSE)
-
-Using finite differences along point dimension:
-$$
-\nabla_n \hat{u}_{b,t,n,c}=\hat{u}_{b,t,n+1,c}-\hat{u}_{b,t,n,c}
-$$
-$$
-\nabla_n u_{b,t,n,c}=u_{b,t,n+1,c}-u_{b,t,n,c}
-$$
-$$
-\mathcal{L}_{gmse}=\mathrm{MSE}(\nabla_n \hat{u}, \nabla_n u)
-$$
-
-GMSE constrains local variation patterns and combats over-smoothing in high
-gradient regions.
-
-### 5.2 Why this composite loss was used
-
-- `mse` anchors global accuracy and stable optimization scale.
-- `l1` improves robustness and sharper residual fitting.
-- `temp` aligns temporal evolution statistics.
-- `airfoil` encodes a hard physical prior (no-slip) as a soft training term.
-- `gmse` preserves fine-scale spatial structure.
-
-The combined objective balances global correctness, temporal fidelity, boundary
-physics, and local sharpness.
-
-### 5.3 Effective weighting in this submission
-
-With configured coefficients:
-
-$$
-\mathcal{L}
-=1.0\,\mathcal{L}_{mse}
-+0.1\,\mathcal{L}_{l1}
-+0.5\,\mathcal{L}_{temp}
-+(0.2\times 5.0)\,\mathcal{L}_{airfoil}
-+0.5\,\mathcal{L}_{gmse}
-$$
-
-So the effective airfoil multiplier is `1.0` relative to raw
-$\mathcal{L}_{airfoil}$.
-
-Training weights (from run logs):
-
-- `alpha=1.0`
-- `beta=0.1`
-- `gamma=0.5`
-- `delta=0.2`
-- `airfoil_weight=5.0`
-- `lambda_grad=0.5`
-
----
-
-## 6) Optimization and schedule
-
-Training protocol used for the final members:
-
-- Optimizer: `AdamW`
-- Initial LR: `2e-4`
-- Weight decay: `1e-4`
-- Epochs: `300`
-- Batch size: `1`
-- Grad clip: `1.0`
-- AMP: enabled
-- Scheduler: warmup + cosine annealing
-- Warmup epochs: `5`
-
-All reported VRT members have:
-
-- model params: `18,249,359` total/trainable
-
----
-
-## 7) Data split and augmentation protocol
-
-The VRT training path in `train.py` uses:
-
-- simulation-aware split mode
-- fixed number of validation simulations (via trainer defaults)
-- y-reflection augmentation applied to training data only
-- validation kept on original orientation (no reflection duplication)
-
-For listed runs, each member uses its own `(seed, split_seed)` pair, improving
-ensemble diversity while preserving architecture and objective.
-
----
-
-## 8) Final trained members used for submission
-
-The final submission ensemble consists of 4 independently trained members with
-distinct random seeds and split seeds for diversity.
-
-Each member is stored with:
-
-- `checkpoints/memberX/best.pt`
-- `checkpoints/memberX/vrt_flow_stats.pt`
-
----
-
-## 9) Inference-time ensembling strategy
-
-`VRTEnsemble` performs:
-
-1. Forward each of 4 members on original input
-2. Reflect input across y-axis and forward each member again
-3. Unreflect reflected predictions back to original coordinates
-4. Average all 8 predictions
-
-Additionally, a hard fallback can be applied:
-
-- If input has very high norm but low temporal change, return persistence
-  (repeat last input frame), then apply no-slip boundary projection.
-
-Current wrapper defaults:
-
-- `enable_reflection_tta=True`
-- `enable_hard_fallback=True`
-
----
-
-## 10) Run outcomes
-
-For the four final members, the best validation values reached were:
-
-- `seed7_split3`: best val L2 `0.6007`, best val relL2 `0.0427`
-- `seed24_split31`: best val L2 `0.7058`, best val relL2 `0.0471`
-- `seed20260421_split41820260`: best val L2 `0.7402`, best val relL2 `0.0496`
-- `seed2026_split4182`: best val L2 `0.6654`, best val relL2 `0.0439`
-
-These values are aggregated from the training records of the four selected members.
-
----
-
-## 11) Evaluation metrics and final benchmark results
-
-Let $\hat{u}, u \in \mathbb{R}^{B\times T\times N\times 3}$ be prediction and
-ground truth, and $u^{persist}$ be persistence baseline (repeat last input
-frame). For sample index $b$, timestep $t$, point $n$:
-
-### 11.1 Primary evaluation metrics
-
-**Relative L2 error**
-$$
-\mathrm{RelL2}
-= \frac{1}{B}\sum_b
-\frac{\|\hat{u}_b-u_b\|_2}{\|u_b\|_2+\epsilon}
-$$
-where norms are over all flattened $(T,N,3)$ elements.
-
-**Temporal rollout error**
-$$
-\mathrm{Rollout}
-= \frac{1}{B}\sum_b \frac{1}{T}\sum_t
-\frac{\|\hat{u}_{b,t}-u_{b,t}\|_2}{\|u_{b,t}\|_2+\epsilon}
-$$
-
-**High-frequency residual L2**
-$$
-\bar{u}_b=\frac{1}{T}\sum_t u_{b,t},\quad
-\bar{\hat{u}}_b=\frac{1}{T}\sum_t \hat{u}_{b,t}
-$$
-$$
-\mathrm{HFRes}
-= \frac{1}{B}\sum_b
-\frac{\|(\hat{u}_b-\bar{\hat{u}}_b)-(u_b-\bar{u}_b)\|_2}
-{\|u_b-\bar{u}_b\|_2+\epsilon}
-$$
-
-**Boundary condition error**
-$$
-\mathrm{BCE}
-= \frac{1}{B}\sum_b
-\sqrt{
-\frac{1}{T|\mathcal{A}_b|}
-\sum_{t}\sum_{n\in\mathcal{A}_b}\|\hat{u}_{b,t,n}\|_2^2 + \epsilon
-}
-$$
-where $\mathcal{A}_b$ is the airfoil/boundary index set.
-
-### 11.2 Training-log style auxiliary metrics
-
-**L2 (competition metric)**
-$$
-\mathrm{L2}
-= \frac{1}{B}\sum_b \frac{1}{TN}\sum_{t,n}\|\hat{u}_{b,t,n}-u_{b,t,n}\|_2
-$$
-
-**L1**
-$$
-\mathrm{L1}
-= \frac{1}{BTN3}\sum_{b,t,n,c}|\hat{u}_{btnc}-u_{btnc}|
-$$
-
-**MSE**
-$$
-\mathrm{MSE}
-= \frac{1}{BTN3}\sum_{b,t,n,c}(\hat{u}_{btnc}-u_{btnc})^2
-$$
-
-**GMSE**
-$$
-\mathrm{GMSE}
-= \mathrm{MSE}\!\left(
-(\hat{u}_{:,:,1:,:}-\hat{u}_{:,:,:-1,:}),
-(u_{:,:,1:,:}-u_{:,:,:-1,:})
-\right)
-$$
-
-**Weighted L2 and vs\_persist**
-
-Define point weights from persistence innovation:
-$$
-\Delta_{b,n}=\frac{1}{T}\sum_t\|u_{b,t,n}-u^{persist}_{b,t,n}\|_2,\quad
-w_{b,n}=\frac{\Delta_{b,n}+\epsilon}{\sum_n(\Delta_{b,n}+\epsilon)}
-$$
-
-Then:
-$$
-\mathrm{wL2}_b = \frac{1}{T}\sum_t\sum_n w_{b,n}\|\hat{u}_{b,t,n}-u_{b,t,n}\|_2
-$$
-$$
-\mathrm{pL2}_b = \frac{1}{T}\sum_t\sum_n w_{b,n}\|u^{persist}_{b,t,n}-u_{b,t,n}\|_2
-$$
-$$
-\mathrm{weighted\_l2}=\frac{1}{B}\sum_b \mathrm{wL2}_b,\quad
-\mathrm{vs\_persist}=\frac{1}{B}\sum_b\frac{\mathrm{wL2}_b}{\mathrm{pL2}_b+\epsilon}
-$$
-
-Final reported mean results for this submission (mean over the evaluation set):
-
-- `relative_l2_error`: `0.016577152168689664`
-- `temporal_rollout_error`: `0.016529230637325656`
-- `high_frequency_residual_l2`: `0.20932431787620356`
-- `boundary_condition_error`: `9.999999974752427e-07`
-- `vs_persist`: `0.13580659090736766`
-- `l2`: `0.30194369584710384`
-- `weighted_l2`: `1.4445130011693426`
-- `l1`: `0.14753634393320994`
-- `mse`: `0.18546677442167814`
-- `gmse`: `0.2883375277318957`
-
----
-
-## 12) Final submitted model (clear statement)
-
-The submission is a **composite inference system**, not a single network:
-
-- 4x independently trained VRT members
-- per-member external normalization/stats files
-- reflection TTA (2x per member)
-- arithmetic mean aggregation across 8 outputs
-- optional hard persistence fallback
-- explicit no-slip boundary projection in model forward
-
-The final predictor used in evaluation is the ensemble wrapper provided in this
-submission package.
+"""
+Volumetric Routing Transformer (VRT) for GRaM.
+
+"""
+
+from __future__ import annotations
+
+import math
+import os
+from typing import Optional
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+def _sanitize_boundary_idx(idx: torch.Tensor, num_points: int, device: torch.device) -> torch.Tensor:
+    """Clamp boundary indices into valid point range and ensure long dtype."""
+    if idx.numel() == 0:
+        return idx.to(device=device, dtype=torch.long)
+    return idx.to(device=device, dtype=torch.long).clamp_(0, num_points - 1)
+
+
+def generate_fourier_features(x: torch.Tensor, num_frequencies: int) -> torch.Tensor:
+    """Expand coordinates with sin/cos Fourier bands."""
+    if num_frequencies <= 0:
+        return x
+    frequency_bands = (
+        2.0 ** torch.arange(num_frequencies, device=x.device, dtype=x.dtype) * math.pi
+    )
+    scaled_x = x.unsqueeze(-1) * frequency_bands
+    spectral_encoding = torch.cat([scaled_x.sin(), scaled_x.cos()], dim=-1).reshape(
+        *x.shape[:-1], -1
+    )
+    return torch.cat([x, spectral_encoding], dim=-1)
+
+
+@torch.no_grad()
+def calculate_distance_to_boundary(
+    positions: torch.Tensor, boundary_indices: list[torch.Tensor], chunk_size: int = 8192
+) -> torch.Tensor:
+    """Shortest Euclidean distance from each point to nearest boundary point."""
+    batch_size, num_points, _ = positions.shape
+    distances = torch.empty(
+        batch_size, num_points, device=positions.device, dtype=positions.dtype
+    )
+    for b in range(batch_size):
+        idx = _sanitize_boundary_idx(boundary_indices[b], num_points, positions.device)
+        if idx.numel() == 0:
+            distances[b].zero_()
+            continue
+        surface_points = positions[b].index_select(0, idx)
+        parts = []
+        for chunk in positions[b].split(chunk_size):
+            parts.append(torch.cdist(chunk, surface_points).min(dim=1).values)
+        distances[b] = torch.cat(parts, dim=0)
+    return distances
+
+
+@torch.no_grad()
+def nearest_boundary_geometry(
+    positions: torch.Tensor,
+    boundary_indices: list[torch.Tensor],
+    chunk_size: int = 8192,
+    eps: float = 1e-8,
+) -> tuple[torch.Tensor, torch.Tensor]:
+
+    bsz, npts, _ = positions.shape
+    distances = torch.empty(bsz, npts, device=positions.device, dtype=positions.dtype)
+    directions = torch.zeros(bsz, npts, 3, device=positions.device, dtype=positions.dtype)
+    for b in range(bsz):
+        idx = _sanitize_boundary_idx(boundary_indices[b], npts, positions.device)
+        if idx.numel() == 0:
+            distances[b].zero_()
+            continue
+        surface_points = positions[b].index_select(0, idx)
+        d_parts: list[torch.Tensor] = []
+        j_parts: list[torch.Tensor] = []
+        for chunk in positions[b].split(chunk_size):
+            d = torch.cdist(chunk, surface_points)
+            mn, j = d.min(dim=1)
+            d_parts.append(mn)
+            j_parts.append(j)
+        dist_b = torch.cat(d_parts, dim=0)
+        nearest_idx = torch.cat(j_parts, dim=0)
+        nearest = surface_points[nearest_idx]
+        vec = nearest - positions[b]
+        unit = vec / dist_b.unsqueeze(-1).clamp(min=eps)
+        unit = torch.where(dist_b.unsqueeze(-1) < eps, torch.zeros_like(unit), unit)
+        distances[b] = dist_b
+        directions[b] = unit
+    return distances, directions
+
+
+class PointwiseSwiGLUBlock(nn.Module):
+    def __init__(self, dimension: int, expansion_multiplier: float = 8 / 3):
+        super().__init__()
+        hidden_dim = int(dimension * expansion_multiplier)
+        hidden_dim = (hidden_dim + 1) // 2 * 2
+        self.layer_norm = nn.LayerNorm(dimension)
+        self.gate_proj = nn.Linear(dimension, hidden_dim, bias=False)
+        self.up_proj = nn.Linear(dimension, hidden_dim, bias=False)
+        self.down_proj = nn.Linear(hidden_dim, dimension, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        n = self.layer_norm(x)
+        g = F.silu(self.gate_proj(n)) * self.up_proj(n)
+        return x + self.down_proj(g)
+
+
+class TemporalVelocityEncoder(nn.Module):
+    def __init__(self, in_channels: int = 3, out_dimension: int = 64):
+        super().__init__()
+        self.out_dimension = out_dimension
+        self.temporal_convs = nn.Sequential(
+            nn.Conv1d(in_channels, 64, kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.Conv1d(64, out_dimension, kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.Conv1d(out_dimension, out_dimension, kernel_size=1),
+        )
+        self.feature_fusion = nn.Linear(out_dimension * 2, out_dimension, bias=False)
+
+    def forward(self, normalized_velocity: torch.Tensor) -> torch.Tensor:
+        bsz, time_steps, npts, channels = normalized_velocity.shape
+        sequence = normalized_velocity.permute(0, 2, 3, 1).reshape(
+            bsz * npts, channels, time_steps
+        )
+        feat = self.temporal_convs(sequence)
+        avg = feat.mean(dim=-1)
+        latest = feat[:, :, -1]
+        fused = self.feature_fusion(torch.cat([avg, latest], dim=-1))
+        return fused.reshape(bsz, npts, self.out_dimension)
+
+
+# =========================================================================
+# 3D ConvNeXt V2 
+# =========================================================================
+
+class GRN(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.zeros(1, 1, 1, 1, dim))
+        self.beta = nn.Parameter(torch.zeros(1, 1, 1, 1, dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x shape: (B, D, H, W, C)
+        gx = x.norm(p=2, dim=(1, 2, 3), keepdim=True)
+        nx = gx / (gx.mean(dim=-1, keepdim=True) + 1e-6)
+        return self.gamma * (x * nx) + self.beta + x
+
+
+class ConvNeXtV2Block3D(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dwconv = nn.Conv3d(dim, dim, kernel_size=7, padding=3, groups=dim)
+        self.norm = nn.LayerNorm(dim, eps=1e-6)
+        self.pwconv1 = nn.Linear(dim, 4 * dim) 
+        self.act = nn.GELU()
+        self.grn = GRN(4 * dim)
+        self.pwconv2 = nn.Linear(4 * dim, dim)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        input_res = x
+        x = self.dwconv(x)
+        # Permute to (B, D, H, W, C) for LayerNorm and Linear layers
+        x = x.permute(0, 2, 3, 4, 1)
+        x = self.norm(x)
+        x = self.pwconv1(x)
+        x = self.act(x)
+        x = self.grn(x)
+        x = self.pwconv2(x)
+        # Permute back to (B, C, D, H, W)
+        x = x.permute(0, 4, 1, 2, 3)
+        return input_res + x
+
+
+class SOTAConvNeXtV2Lattice(nn.Module):
+    def __init__(
+        self,
+        hidden_dim: int,
+        grid_resolution: tuple[int, int, int] = (64, 32, 32),
+        base_channels: int = 64,
+    ):
+        super().__init__()
+        self.grid_resolution = tuple(grid_resolution)
+        c1, c2, c3, c4 = base_channels, base_channels * 2, base_channels * 4, base_channels * 8
+
+        self.proj_in = nn.Conv3d(hidden_dim, c1, kernel_size=3, padding=1)
+        
+        # Stacking multiple blocks safely increases capacity without breaking FLOP budget
+        self.encoder_level1 = nn.Sequential(ConvNeXtV2Block3D(c1), ConvNeXtV2Block3D(c1))
+        self.downsample1 = nn.Conv3d(c1, c2, kernel_size=2, stride=2)
+
+        self.encoder_level2 = nn.Sequential(ConvNeXtV2Block3D(c2), ConvNeXtV2Block3D(c2))
+        self.downsample2 = nn.Conv3d(c2, c3, kernel_size=2, stride=2)
+
+        self.encoder_level3 = nn.Sequential(ConvNeXtV2Block3D(c3), ConvNeXtV2Block3D(c3))
+        self.downsample3 = nn.Conv3d(c3, c4, kernel_size=2, stride=2)
+
+        self.bottleneck = nn.Sequential(
+            ConvNeXtV2Block3D(c4),
+            ConvNeXtV2Block3D(c4),
+            ConvNeXtV2Block3D(c4)
+        )
+
+        # Replaced torch.cat with Additive skips for memory/FLOP optimization
+        self.upsample3 = nn.ConvTranspose3d(c4, c3, kernel_size=2, stride=2)
+        self.decoder_level3 = nn.Sequential(ConvNeXtV2Block3D(c3), ConvNeXtV2Block3D(c3))
+
+        self.upsample2 = nn.ConvTranspose3d(c3, c2, kernel_size=2, stride=2)
+        self.decoder_level2 = nn.Sequential(ConvNeXtV2Block3D(c2), ConvNeXtV2Block3D(c2))
+
+        self.upsample1 = nn.ConvTranspose3d(c2, c1, kernel_size=2, stride=2)
+        self.decoder_level1 = nn.Sequential(ConvNeXtV2Block3D(c1), ConvNeXtV2Block3D(c1))
+
+        self.final_projection = nn.Conv3d(c1, hidden_dim, kernel_size=1)
+
+    def scatter_points_to_lattice(
+        self, features: torch.Tensor, normalized_coords: torch.Tensor
+    ) -> torch.Tensor:
+        bsz, npts, channels = features.shape
+        gx, gy, gz = self.grid_resolution
+
+        coords = normalized_coords.clamp(0, 1 - 1e-6)
+        idx_x = (coords[..., 0] * gx).floor().long()
+        idx_y = (coords[..., 1] * gy).floor().long()
+        idx_z = (coords[..., 2] * gz).floor().long()
+        flat = idx_x * (gy * gz) + idx_y * gz + idx_z
+
+        lattice_state = torch.zeros(
+            bsz, channels, gx * gy * gz, device=features.device, dtype=features.dtype
+        )
+        lattice_count = torch.zeros(
+            bsz, 1, gx * gy * gz, device=features.device, dtype=features.dtype
+        )
+
+        lattice_state.scatter_add_(2, flat.unsqueeze(1).expand(-1, channels, -1), features.transpose(1, 2))
+        lattice_count.scatter_add_(2, flat.unsqueeze(1), torch.ones(bsz, 1, npts, device=features.device, dtype=features.dtype))
+        avg = lattice_state / lattice_count.clamp(min=1.0)
+        return avg.view(bsz, channels, gx, gy, gz)
+
+    def sample_lattice_to_points(
+        self, lattice_features: torch.Tensor, normalized_coords: torch.Tensor
+    ) -> torch.Tensor:
+        bsz, npts = lattice_features.shape[0], normalized_coords.shape[1]
+        grid = (normalized_coords * 2.0 - 1.0)[..., [2, 1, 0]].view(bsz, 1, 1, npts, 3)
+        sampled = F.grid_sample(
+            lattice_features, grid, mode="bilinear", padding_mode="border", align_corners=False
+        )
+        return sampled.squeeze(2).squeeze(2).transpose(1, 2)
+
+    def forward(self, features: torch.Tensor, normalized_coords: torch.Tensor) -> torch.Tensor:
+        lattice = self.scatter_points_to_lattice(features, normalized_coords)
+        
+        enc1 = self.encoder_level1(self.proj_in(lattice))
+        enc2 = self.encoder_level2(self.downsample1(enc1))
+        enc3 = self.encoder_level3(self.downsample2(enc2))
+        
+        bottleneck = self.bottleneck(self.downsample3(enc3))
+        
+        dec3 = self.upsample3(bottleneck) + enc3
+        dec3 = self.decoder_level3(dec3)
+        
+        dec2 = self.upsample2(dec3) + enc2
+        dec2 = self.decoder_level2(dec2)
+        
+        dec1 = self.upsample1(dec2) + enc1
+        dec1 = self.decoder_level1(dec1)
+        
+        return self.sample_lattice_to_points(self.final_projection(dec1), normalized_coords)
+
+# =========================================================================
+
+class VolumetricRoutingTransformer(nn.Module):
+    def __init__(
+        self,
+        hidden_dimension: int = 256,
+        num_pre_blocks: int = 3,
+        num_post_blocks: int = 6,
+        grid_resolution: tuple[int, int, int] = (64, 32, 32),
+        base_channels: int = 64,
+        temporal_dim: int = 64,
+        num_pos_freqs: int = 10,
+        num_vel_freqs: int = 4,
+        num_dist_freqs: int = 8,
+        t_out: int = 5,
+        pretrained_path: Optional[str] = None,
+    ):
+        super().__init__()
+        self.t_out = t_out
+        self.num_pos_freqs = num_pos_freqs
+        self.num_vel_freqs = num_vel_freqs
+        self.num_dist_freqs = num_dist_freqs
+        self.enable_timing = False
+        self._last_timers: dict[str, float] = {}
+
+        pos_dim = 3 * (1 + 2 * self.num_pos_freqs)
+        vin_flat_dim = 15
+        vel_fourier_dim = 3 * 2 * self.num_vel_freqs
+        dist_dim = 4 + 2 * self.num_dist_freqs
+        geom_dir_dim = 3
+        flow_stat_dim = 2
+        total_input_dim = (
+            pos_dim
+            + vin_flat_dim
+            + vel_fourier_dim
+            + dist_dim
+            + geom_dir_dim
+            + flow_stat_dim
+            + 1
+            + temporal_dim
+        )
+
+        self.temporal_encoder = TemporalVelocityEncoder(in_channels=3, out_dimension=temporal_dim)
+        self.initial_feature_projection = nn.Linear(total_input_dim, hidden_dimension)
+        self.pre_routing_blocks = nn.ModuleList(
+            [PointwiseSwiGLUBlock(hidden_dimension) for _ in range(num_pre_blocks)]
+        )
+        
+        self.spatial_lattice_solver = SOTAConvNeXtV2Lattice(
+            hidden_dimension, grid_resolution=grid_resolution, base_channels=base_channels
+        )
+        
+        self.post_routing_blocks = nn.ModuleList(
+            [PointwiseSwiGLUBlock(hidden_dimension) for _ in range(num_post_blocks)]
+        )
+        self.final_normalization = nn.LayerNorm(hidden_dimension)
+        self.velocity_delta_projection = nn.Linear(hidden_dimension, 3 * t_out)
+        nn.init.zeros_(self.velocity_delta_projection.weight)
+        nn.init.zeros_(self.velocity_delta_projection.bias)
+        self.register_buffer("flow_channel_mean", torch.zeros(1, 1, 1, 3), persistent=False)
+        self.register_buffer("flow_channel_scale", torch.ones(1, 1, 1, 3), persistent=False)
+        self.register_buffer("spatial_bounds_lo", torch.zeros(1, 1, 3), persistent=False)
+        self.register_buffer("spatial_bounds_hi", torch.ones(1, 1, 3), persistent=False)
+        if pretrained_path is not None and len(pretrained_path) > 0 and os.path.exists(pretrained_path):
+            state_dict = torch.load(pretrained_path, map_location="cpu", weights_only=True)
+            self.load_state_dict(state_dict, strict=False)
+
+    def _load_from_state_dict(
+        self,
+        state_dict: dict,
+        prefix: str,
+        local_metadata,
+        strict: bool,
+        missing_keys: list[str],
+        unexpected_keys: list[str],
+        error_msgs: list[str],
+    ) -> None:
+        for key in (
+            prefix + "flow_channel_mean",
+            prefix + "flow_channel_scale",
+            prefix + "spatial_bounds_lo",
+            prefix + "spatial_bounds_hi",
+        ):
+            state_dict.pop(key, None)
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
+    @torch.no_grad()
+    def set_flow_stats(self, mean: torch.Tensor, scale: torch.Tensor) -> None:
+        self.flow_channel_mean.copy_(mean.reshape(1, 1, 1, 3).to(self.flow_channel_mean))
+        self.flow_channel_scale.copy_(scale.reshape(1, 1, 1, 3).to(self.flow_channel_scale))
+
+    @torch.no_grad()
+    def set_spatial_bounds(self, lo: torch.Tensor, hi: torch.Tensor) -> None:
+        self.spatial_bounds_lo.copy_(lo.reshape(1, 1, 3).to(self.spatial_bounds_lo))
+        self.spatial_bounds_hi.copy_(hi.reshape(1, 1, 3).to(self.spatial_bounds_hi))
+
+    @torch.no_grad()
+    def load_flow_stats(self, stats_path: str) -> None:
+        payload = torch.load(stats_path, map_location="cpu", weights_only=False)
+        if not isinstance(payload, dict):
+            raise ValueError(f"Invalid flow-stats file (expected dict): {stats_path}")
+        if "flow_channel_mean" in payload and "flow_channel_scale" in payload:
+            mean = torch.as_tensor(payload["flow_channel_mean"], dtype=torch.float32)
+            scale = torch.as_tensor(payload["flow_channel_scale"], dtype=torch.float32)
+        else:
+            raise KeyError(
+                f"Flow-stats file missing required keys in {stats_path}. "
+                "Need flow_channel_mean/flow_channel_scale."
+            )
+        self.set_flow_stats(mean, scale)
+
+        if "spatial_bounds_lo" in payload and "spatial_bounds_hi" in payload:
+            lo = torch.as_tensor(payload["spatial_bounds_lo"], dtype=torch.float32)
+            hi = torch.as_tensor(payload["spatial_bounds_hi"], dtype=torch.float32)
+            self.set_spatial_bounds(lo, hi)
+        else:
+            raise KeyError(
+                f"Flow-stats file missing required keys in {stats_path}. "
+                "Need spatial_bounds_lo/spatial_bounds_hi."
+            )
+
+    @torch.no_grad()
+    def save_flow_stats(self, stats_path: str) -> None:
+        os.makedirs(os.path.dirname(os.path.abspath(stats_path)), exist_ok=True)
+        payload = {
+            "flow_channel_mean": self.flow_channel_mean.detach().cpu().view(3),
+            "flow_channel_scale": self.flow_channel_scale.detach().cpu().view(3),
+            "spatial_bounds_lo": self.spatial_bounds_lo.detach().cpu().view(3),
+            "spatial_bounds_hi": self.spatial_bounds_hi.detach().cpu().view(3),
+        }
+        torch.save(payload, stats_path)
+
+    def forward(
+        self,
+        t: torch.Tensor,
+        pos: torch.Tensor,
+        idcs_airfoil: list[torch.Tensor],
+        velocity_in: torch.Tensor,
+    ) -> torch.Tensor:
+        del t
+        timings: dict[str, float] = {}
+        if self.enable_timing and pos.device.type == "cuda":
+            torch.cuda.synchronize(pos.device)
+        t0 = torch.cuda.Event(enable_timing=True) if (self.enable_timing and pos.device.type == "cuda") else None
+        t1 = torch.cuda.Event(enable_timing=True) if (self.enable_timing and pos.device.type == "cuda") else None
+
+        if t0 is not None:
+            t0.record()
+        surface_distances, boundary_dirs = nearest_boundary_geometry(pos, idcs_airfoil)
+        if t1 is not None:
+            t1.record()
+            torch.cuda.synchronize(pos.device)
+            timings["distance"] = t0.elapsed_time(t1) / 1000.0
+
+        bsz, _, npts, _ = velocity_in.shape
+        last_velocity_frame = velocity_in[:, -1]
+        normalized_velocity = (velocity_in - self.flow_channel_mean) / self.flow_channel_scale
+
+        position_features = generate_fourier_features(pos, self.num_pos_freqs)
+        flattened_velocity_history = normalized_velocity.permute(0, 2, 1, 3).reshape(bsz, npts, 15)
+
+        vel_frequencies = (
+            2.0 ** torch.arange(self.num_vel_freqs, device=pos.device, dtype=pos.dtype) * math.pi
+        )
+        scaled_last_vel = normalized_velocity[:, -1].unsqueeze(-1) * vel_frequencies
+        last_velocity_spectral = torch.cat([scaled_last_vel.sin(), scaled_last_vel.cos()], dim=-1).reshape(bsz, npts, -1)
+
+        temporal_features = self.temporal_encoder(normalized_velocity)
+        speed = torch.linalg.norm(normalized_velocity, dim=-1)  # (B, T, N)
+        flow_mean_speed = speed.mean(dim=1, keepdim=False).unsqueeze(-1)  # (B, N, 1)
+        flow_std_speed = speed.std(dim=1, unbiased=False, keepdim=False).unsqueeze(-1)  # (B, N, 1)
+
+        boundary_mask = torch.zeros(bsz, npts, 1, device=pos.device, dtype=pos.dtype)
+        for b, idx in enumerate(idcs_airfoil):
+            idx = _sanitize_boundary_idx(idx, npts, pos.device)
+            if idx.numel() > 0:
+                boundary_mask[b, idx, 0] = 1.0
+
+        dist_expanded = surface_distances.unsqueeze(-1)
+        dist_log = torch.log1p(dist_expanded)
+        # Per-sample normalization over points (B, 1, 1) keeps rank aligned with (B, N, 1).
+        dist_norm = dist_expanded / dist_expanded.amax(dim=1, keepdim=True).clamp_min(1e-6)
+        dist_inv = 1.0 / (1.0 + dist_expanded)
+        dist_frequencies = (
+            2.0 ** torch.arange(self.num_dist_freqs, device=pos.device, dtype=pos.dtype) * math.pi
+        )
+        scaled_dist = dist_log * dist_frequencies
+        distance_features = torch.cat(
+            [dist_expanded, dist_log, dist_norm, dist_inv, scaled_dist.sin(), scaled_dist.cos()],
+            dim=-1,
+        )
+
+        features = torch.cat(
+            [
+                position_features,
+                flattened_velocity_history,
+                last_velocity_spectral,
+                temporal_features,
+                flow_mean_speed,
+                flow_std_speed,
+                distance_features,
+                boundary_dirs,
+                boundary_mask,
+            ],
+            dim=-1,
+        )
+        hidden = self.initial_feature_projection(features)
+
+        for block in self.pre_routing_blocks:
+            hidden = block(hidden)
+
+        # Guard against degenerate/invalid bounds that can produce NaNs/Infs and
+        # later invalid lattice indices on CUDA.
+        bounds_span = (self.spatial_bounds_hi - self.spatial_bounds_lo).clamp_min(1e-6)
+        normalized_coords = (pos - self.spatial_bounds_lo) / bounds_span
+        normalized_coords = torch.nan_to_num(normalized_coords, nan=0.5, posinf=1.0, neginf=0.0)
+        normalized_coords = normalized_coords.clamp(0.0, 1.0 - 1e-6)
+        hidden = hidden + self.spatial_lattice_solver(hidden, normalized_coords)
+
+        for block in self.post_routing_blocks:
+            hidden = block(hidden)
+
+        delta_norm = self.velocity_delta_projection(self.final_normalization(hidden))
+        delta_norm = delta_norm.reshape(bsz, npts, self.t_out, 3).permute(0, 2, 1, 3)
+        pred = last_velocity_frame.unsqueeze(1) + (delta_norm * self.flow_channel_scale)
+
+        for b, idx in enumerate(idcs_airfoil):
+            idx = _sanitize_boundary_idx(idx, npts, pred.device)
+            if idx.numel() > 0:
+                pred[b, :, idx, :] = 0.0
+
+        self._last_timers = timings if self.enable_timing else {}
+        return pred
