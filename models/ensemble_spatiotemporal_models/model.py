@@ -51,7 +51,7 @@ class MeanOutputEnsemble(nn.Module):
 
 def _load_checkpoint(path: Path) -> dict:
     try:
-        return torch.load(path, map_location="cpu", weights_only=False)
+        return torch.load(path, map_location="cpu", weights_only=True)
     except TypeError:
         return torch.load(path, map_location="cpu")
 
