@@ -36,6 +36,20 @@ from .net import FiniteGraphModelV4, FiniteGraphInferenceWrapperV4
 
 WEIGHTS_FILENAME = "weights.pt"
 
+MODEL_CONFIG = {
+    "in_ch": 26,
+    "hidden": 128,
+    "latent": 128,
+    "k1": 16,
+    "k2": 4,
+    "n_attn_heads": 4,
+    "out_heads": 5,
+    "out_ch_per_head": 3,
+    "shared_weights": False,
+    "dropout": 0.05,
+    "temporal_hidden": 48,
+}
+
 
 class FiniteGraphV4(nn.Module):
     """Two-hop directional finite-graph forecaster for GRaM ICLR 2026 (v4)."""
@@ -53,8 +67,7 @@ class FiniteGraphV4(nn.Module):
             )
 
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-        cfg = ckpt.get("model_config", {})
-        self.inner = FiniteGraphModelV4(**cfg)
+        self.inner = FiniteGraphModelV4(**MODEL_CONFIG)
         self.inner.load_state_dict(ckpt["state_dict"])
         self.inner.eval()
 
