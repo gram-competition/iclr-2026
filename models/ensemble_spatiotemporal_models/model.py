@@ -19,6 +19,12 @@ HF_FILE_BASE = f"{_HF_PATH_PREFIX}/checkpoints_SpatioTemporalGNN_300epochs/best.
 HF_FILE_PHYSFEAT = f"{_HF_PATH_PREFIX}/checkpoints_SpatioTemporalGNNPhysFeat_100epochs/best.pt"
 
 
+def _sanitize_airfoil_idx(idx: torch.Tensor, num_points: int, device: torch.device) -> torch.Tensor:
+    if idx.numel() == 0:
+        return idx.to(device=device, dtype=torch.long)
+    return idx.to(device=device, dtype=torch.long).clamp_(0, num_points - 1)
+
+
 class MeanOutputEnsemble(nn.Module):
     """Average outputs from two competition-compatible forecasters."""
 
@@ -128,11 +134,18 @@ class EnsembleSpatioTemporalModels(nn.Module):
         self.in_step_mean_threshold = in_step_mean_threshold
 
         package_dir = Path(__file__).parent.resolve()
-        if torch.cuda.is_available():
-            self.device = torch.device("cuda:0")
-        else:
-            self.device = torch.device("cpu")
+        # Keep construction device-agnostic. The evaluator may later call
+        # model.to(cuda:N), and forward should follow that runtime device.
+        self.device = torch.device("cpu")
         self.ensemble = _load_spatiotemporal_pair_mean_ensemble(package_dir, self.device)
+
+    def _runtime_device(self, fallback: torch.device) -> torch.device:
+        """Resolve the actual device where ensemble params/buffers currently live."""
+        for p in self.ensemble.parameters():
+            return p.device
+        for b in self.ensemble.buffers():
+            return b.device
+        return fallback
 
     @torch.no_grad()
     def _should_use_persistence_fallback(self, velocity_in: torch.Tensor) -> bool:
@@ -155,8 +168,9 @@ class EnsembleSpatioTemporalModels(nn.Module):
         last = velocity_in[:, -1:, :, :]
         pred = last.repeat(1, t_out, 1, 1).contiguous()
         for b, idx in enumerate(idcs_airfoil):
+            idx = _sanitize_airfoil_idx(idx, pred.shape[2], pred.device)
             if idx.numel() > 0:
-                pred[b, :, idx.long().to(pred.device), :] = 0.0
+                pred[b, :, idx, :] = 0.0
         return pred
 
     def forward(
@@ -167,10 +181,13 @@ class EnsembleSpatioTemporalModels(nn.Module):
         velocity_in: torch.Tensor,
     ) -> torch.Tensor:
         input_device = pos.device
-        t = t.to(self.device)
-        pos = pos.to(self.device)
-        velocity_in = velocity_in.to(self.device)
-        idcs_airfoil = [idx.to(self.device) for idx in idcs_airfoil]
+        runtime_device = self._runtime_device(input_device)
+        self.device = runtime_device
+        t = t.to(runtime_device)
+        pos = pos.to(runtime_device)
+        velocity_in = velocity_in.to(runtime_device)
+        n_pts = pos.shape[1]
+        idcs_airfoil = [_sanitize_airfoil_idx(idx, n_pts, runtime_device) for idx in idcs_airfoil]
 
         with torch.inference_mode():
             if self.enable_hard_fallback and self._should_use_persistence_fallback(velocity_in):
