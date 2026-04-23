@@ -1,6 +1,6 @@
 import torch
 
-from models import MLP as Model
+from models import VRTEnsemble as Model
 
 # The model constructor has to be callable without arguments
 model = Model()
