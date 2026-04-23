@@ -12,6 +12,12 @@ from .gnn_base import FourierPosEnc
 from .temporal import TemporalAttentionHead
 
 
+def _sanitize_airfoil_idx(idx: torch.Tensor, num_points: int, device: torch.device) -> torch.Tensor:
+    if idx.numel() == 0:
+        return idx.to(device=device, dtype=torch.long)
+    return idx.to(device=device, dtype=torch.long).clamp_(0, num_points - 1)
+
+
 def _timer_now(device: torch.device | str) -> float:
     if isinstance(device, str):
         use_cuda = device.startswith("cuda") and torch.cuda.is_available()
@@ -31,7 +37,11 @@ def _point_surface_distance_and_direction(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return dist (N,1), unit direction from pos toward nearest airfoil point (N,3)."""
     N = pos.size(0)
-    idx = airfoil_idx.to(pos.device).long()
+    idx = _sanitize_airfoil_idx(airfoil_idx, N, pos.device)
+    if idx.numel() == 0:
+        zeros_dist = torch.zeros(N, 1, device=pos.device, dtype=pos.dtype)
+        zeros_dir = torch.zeros(N, 3, device=pos.device, dtype=pos.dtype)
+        return zeros_dist, zeros_dir
     af = pos.index_select(0, idx)
     dist_parts: list[torch.Tensor] = []
     nn_parts: list[torch.Tensor] = []
@@ -130,6 +140,7 @@ class SpatioTemporalGNNPhysFeat(nn.Module):
         device = pos.device
         timings: dict[str, float] = {}
         t_prev = _timer_now(device) if self.enable_timing else 0.0
+        airfoil_idx = _sanitize_airfoil_idx(airfoil_idx, N, device)
 
         mask = pos.new_zeros(N, 1)
         mask[airfoil_idx.long()] = 1.0
@@ -202,10 +213,11 @@ class SpatioTemporalGNNPhysFeat(nn.Module):
         outputs = []
         totals: dict[str, float] = {}
         for b in range(B):
+            n_pts = pos[b].shape[0]
             out, timings = self._forward_single(
                 pos[b],
                 velocity_in[b],
-                idcs_airfoil[b].to(pos.device),
+                _sanitize_airfoil_idx(idcs_airfoil[b], n_pts, pos.device),
             )
             outputs.append(out)
             if self.enable_timing:
