@@ -90,7 +90,7 @@ class VRTEnsemble(nn.Module):
                 raise FileNotFoundError(f"Member {member_idx} missing stats: {stats_path}")
 
         # Load checkpoint to extract hyperparameters
-        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
         args = ckpt.get("args", {})
 
         # Reconstruct model with same hyperparameters
