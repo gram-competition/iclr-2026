@@ -1,0 +1,67 @@
+# Full test-split evaluation (aggregated metrics). No TTY required — use instead of kubectl run -it.
+#
+# Uses /data/checkpoints/best.pt and /data/dataset on warped-ifw-pvc.
+# Ensure no other pod is mounting the same PVC (ReadWriteOnce).
+#
+# kubectl delete job iclr-eval-test-split -n default --ignore-not-found
+# kubectl apply -f k8s/job-eval-test-split.yaml
+# kubectl logs -f job/iclr-eval-test-split -n default
+#
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: iclr-eval-test-split
+  namespace: default
+spec:
+  ttlSecondsAfterFinished: 7200
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        doks.digitalocean.com/gpu-brand: amd
+      tolerations:
+        - key: amd.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: eval
+          image: rocm/pytorch:rocm7.2.1_ubuntu24.04_py3.12_pytorch_release_2.9.1
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              apt-get update -qq && apt-get install -y -qq git git-lfs >/dev/null
+              git lfs install
+              mkdir -p /workspace
+              cd /workspace
+              git clone --depth 1 -b submission-wip-status \
+                https://github.com/fmgreco/iclr-2026.git repo
+              cd repo
+              git lfs pull || true
+              echo "=== Clone HEAD ==="
+              git log -1 --oneline
+              test -f /data/checkpoints/best.pt
+              test -d /data/dataset
+              pip install --no-cache-dir -q 'scipy>=1.11,<1.14' einops pyyaml huggingface_hub 'e3nn>=0.5.0'
+              export PYTHONUNBUFFERED=1
+              python3 src/evaluation/inference.py \
+                --checkpoint-path /data/checkpoints/best.pt \
+                --dataset-dir /data/dataset \
+                --split test \
+                --model-name spatio_temporal_gnn \
+                --batch-size 1 \
+                --device cuda
+          resources:
+            limits:
+              amd.com/gpu: "1"
+            requests:
+              amd.com/gpu: "1"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: warped-ifw-pvc
