@@ -14,6 +14,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def _sanitize_boundary_idx(idx: torch.Tensor, num_points: int, device: torch.device) -> torch.Tensor:
+    """Clamp boundary indices into valid point range and ensure long dtype."""
+    if idx.numel() == 0:
+        return idx.to(device=device, dtype=torch.long)
+    return idx.to(device=device, dtype=torch.long).clamp_(0, num_points - 1)
+
+
 def generate_fourier_features(x: torch.Tensor, num_frequencies: int) -> torch.Tensor:
     """Expand coordinates with sin/cos Fourier bands."""
     if num_frequencies <= 0:
@@ -38,7 +45,7 @@ def calculate_distance_to_boundary(
         batch_size, num_points, device=positions.device, dtype=positions.dtype
     )
     for b in range(batch_size):
-        idx = boundary_indices[b].to(positions.device).long()
+        idx = _sanitize_boundary_idx(boundary_indices[b], num_points, positions.device)
         if idx.numel() == 0:
             distances[b].zero_()
             continue
@@ -62,7 +69,7 @@ def nearest_boundary_geometry(
     distances = torch.empty(bsz, npts, device=positions.device, dtype=positions.dtype)
     directions = torch.zeros(bsz, npts, 3, device=positions.device, dtype=positions.dtype)
     for b in range(bsz):
-        idx = boundary_indices[b].to(positions.device).long()
+        idx = _sanitize_boundary_idx(boundary_indices[b], npts, positions.device)
         if idx.numel() == 0:
             distances[b].zero_()
             continue
@@ -445,8 +452,9 @@ class VolumetricRoutingTransformer(nn.Module):
 
         boundary_mask = torch.zeros(bsz, npts, 1, device=pos.device, dtype=pos.dtype)
         for b, idx in enumerate(idcs_airfoil):
+            idx = _sanitize_boundary_idx(idx, npts, pos.device)
             if idx.numel() > 0:
-                boundary_mask[b, idx.to(pos.device).long(), 0] = 1.0
+                boundary_mask[b, idx, 0] = 1.0
 
         dist_expanded = surface_distances.unsqueeze(-1)
         dist_log = torch.log1p(dist_expanded)
@@ -481,7 +489,12 @@ class VolumetricRoutingTransformer(nn.Module):
         for block in self.pre_routing_blocks:
             hidden = block(hidden)
 
-        normalized_coords = (pos - self.spatial_bounds_lo) / (self.spatial_bounds_hi - self.spatial_bounds_lo)
+        # Guard against degenerate/invalid bounds that can produce NaNs/Infs and
+        # later invalid lattice indices on CUDA.
+        bounds_span = (self.spatial_bounds_hi - self.spatial_bounds_lo).clamp_min(1e-6)
+        normalized_coords = (pos - self.spatial_bounds_lo) / bounds_span
+        normalized_coords = torch.nan_to_num(normalized_coords, nan=0.5, posinf=1.0, neginf=0.0)
+        normalized_coords = normalized_coords.clamp(0.0, 1.0 - 1e-6)
         hidden = hidden + self.spatial_lattice_solver(hidden, normalized_coords)
 
         for block in self.post_routing_blocks:
@@ -492,8 +505,9 @@ class VolumetricRoutingTransformer(nn.Module):
         pred = last_velocity_frame.unsqueeze(1) + (delta_norm * self.flow_channel_scale)
 
         for b, idx in enumerate(idcs_airfoil):
+            idx = _sanitize_boundary_idx(idx, npts, pred.device)
             if idx.numel() > 0:
-                pred[b, :, idx.to(pred.device).long(), :] = 0.0
+                pred[b, :, idx, :] = 0.0
 
         self._last_timers = timings if self.enable_timing else {}
         return pred
