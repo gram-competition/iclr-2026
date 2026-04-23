@@ -57,12 +57,8 @@ class VRTEnsemble(nn.Module):
             model = self._load_member(member_dir, member_idx)
             self.models.append(model)
 
-        # Auto-detect GPU - if CUDA available, use it; otherwise CPU
-        if torch.cuda.is_available():
-            self.device = torch.device("cuda:0")
-            self.to(self.device)
-        else:
-            self.device = torch.device("cpu")
+        # Keep constructor device-agnostic. The evaluator decides device via model.to(...).
+        self.device = torch.device("cpu")
 
     def _load_member(self, member_dir: Path, member_idx: int) -> VolumetricRoutingTransformer:
         """Load a single ensemble member model from local or HuggingFace."""
@@ -174,6 +170,14 @@ class VRTEnsemble(nn.Module):
         pred[..., 1] *= -1.0
         return pred
 
+    def _runtime_device(self, fallback: torch.device) -> torch.device:
+        """Resolve the actual device where model parameters/buffers currently live."""
+        for p in self.models.parameters():
+            return p.device
+        for b in self.models.buffers():
+            return b.device
+        return fallback
+
     def __call__(
         self,
         t: torch.Tensor,
@@ -194,12 +198,14 @@ class VRTEnsemble(nn.Module):
         """
         # Auto-detect input device from input tensors
         input_device = pos.device
-        
-        # Move inputs to model device
-        t = t.to(self.device)
-        pos = pos.to(self.device)
-        velocity_in = velocity_in.to(self.device)
-        idcs_airfoil = [idx.to(self.device) for idx in idcs_airfoil]
+        runtime_device = self._runtime_device(input_device)
+        self.device = runtime_device
+
+        # Move inputs to the actual runtime device.
+        t = t.to(runtime_device)
+        pos = pos.to(runtime_device)
+        velocity_in = velocity_in.to(runtime_device)
+        idcs_airfoil = [idx.to(runtime_device) for idx in idcs_airfoil]
 
         with torch.inference_mode():
             if self.enable_reflection_tta:
