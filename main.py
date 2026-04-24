@@ -7,7 +7,7 @@ model = Model()
 device = next(model.parameters()).device
 
 # Dimensions of the data
-BATCH_SIZE = 95  # number of point clouds in the test split
+BATCH_SIZE = 5  # number of point clouds in the test split
 NUM_T_IN = 5  # number of time points in the input
 NUM_T_OUT = 5  # number of time points in the output
 NUM_POS = 100000  # number of points in space
