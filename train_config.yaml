@@ -1,0 +1,56 @@
+# SpatioTemporalGNN (Submission #22) — flat keys for:
+#   python main.py --config train_config.yaml [CLI overrides YAML]
+#
+# Keys must match argparse dest names exactly (strict loading). Do not use
+# hidden_dim, num_layers, dataset_path, scheduler, precision, strategy, etc.
+# Width/depth are latent_dim → model hidden_dim, num_blocks → num_layers (internal).
+# See models/fmgreco_stnn/PR22_TECHNICAL_BRIEF.md §8 for a wrong→right map.
+#
+# Training checkpoints save payload["args"] = vars(argparse.Namespace) with these same
+# keys. Evaluation merges them into the STNN constructor so best.pt matches training
+# without repeating every flag (still pass --dataset-dir / --config as needed).
+#
+# 8× GPU (DDP), repo root — example:
+#   torchrun --standalone --nproc_per_node=8 main.py \
+#     --config train_config.yaml --dataset-dir /data/dataset/warped-ifw --device cuda
+# (Use your real dataset path; ROCm still uses --device cuda in PyTorch.)
+#
+# Kubernetes: after `cd repo`, add to torchrun:
+#   --config train_config.yaml --dataset-dir /data/dataset ...
+#
+# DDP: per-rank micro-batch = batch_size × gradient_accumulation_steps;
+# global ≈ world_size × that product (e.g. 8 × 1 × 4 = 32 with these defaults).
+# ROCm: keep backend="nccl" in code; PyTorch maps it to RCCL.
+
+model_name: spatio_temporal_gnn
+dataset_dir: dataset_huggingface/warped-ifw
+
+latent_dim: 128
+num_blocks: 12
+num_heads: 4
+num_temporal_layers: 2
+use_so3_backbone: false
+use_steerable_backbone: false
+steerable_lmax: 2
+steerable_temporal_grad_weight: 0.0
+k: 16
+
+batch_size: 1
+gradient_accumulation_steps: 4
+num_workers: 2
+epochs: 100
+lr: 0.0001
+lr_scheduler: one-cycle
+weight_decay: 0.0001
+
+num_points: 100000
+device: cuda
+use_amp: true
+
+# Submission #22 — MCML-oriented defaults (see strategic notes in PR)
+use_pressure: true
+use_relative_velocity_inputs: true
+train_loss_on_velocity_delta: true
+assert_no_slip_train: true
+assert_no_slip_val: true
+no_slip_atol: 0.05

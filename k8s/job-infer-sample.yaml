@@ -1,0 +1,74 @@
+# One-sample inference: clone repo, optional PVC weights, run infer.py on one .npz from the dataset PVC.
+#
+# Expects: PVC warped-ifw-pvc → /data with /data/dataset/*.npz and (recommended) /data/checkpoints/state_dict.pt
+#
+# kubectl apply -f k8s/job-infer-sample.yaml
+# kubectl logs -f job/iclr-infer-sample -n default
+#
+# Uses 1× AMD GPU (same pool/taint as training). For a long-running debug shell, use kubectl run ... instead.
+# infer.py only needs the small pip set below; do not install full requirements.txt (torch-scatter build noise).
+#
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: iclr-infer-sample
+  namespace: default
+spec:
+  ttlSecondsAfterFinished: 3600
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        doks.digitalocean.com/gpu-brand: amd
+      tolerations:
+        - key: amd.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: infer
+          image: rocm/pytorch:rocm7.2.1_ubuntu24.04_py3.12_pytorch_release_2.9.1
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              apt-get update -qq && apt-get install -y -qq git git-lfs >/dev/null
+              git lfs install
+              mkdir -p /workspace
+              cd /workspace
+              git clone --depth 1 -b submission-wip-status \
+                https://github.com/fmgreco/iclr-2026.git repo
+              cd repo
+              git lfs pull || true
+              echo "=== Clone HEAD (infer.py must include vm.cpu()/vs.cpu() for GPU) ==="
+              git log -1 --oneline
+              if [ -f /data/checkpoints/state_dict.pt ]; then
+                cp /data/checkpoints/state_dict.pt models/fmgreco_stnn/state_dict.pt
+                echo "Using weights from PVC /data/checkpoints/state_dict.pt"
+              fi
+              pip install --no-cache-dir -q 'scipy>=1.11,<1.14' einops pyyaml huggingface_hub 'e3nn>=0.5.0'
+              export PYTHONUNBUFFERED=1
+              if [ -f /data/dataset/1021_1-0.npz ]; then
+                cp /data/dataset/1021_1-0.npz ./1021_1-0.npz
+              else
+                SAMPLE="$(ls /data/dataset/*.npz 2>/dev/null | head -n1 || true)"
+                if [ -z "${SAMPLE}" ]; then
+                  echo "No .npz under /data/dataset"; exit 1
+                fi
+                cp "${SAMPLE}" ./1021_1-0.npz
+                echo "Using sample: ${SAMPLE}"
+              fi
+              python3 infer.py
+          resources:
+            limits:
+              amd.com/gpu: "1"
+            requests:
+              amd.com/gpu: "1"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: warped-ifw-pvc
