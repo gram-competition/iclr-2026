@@ -1,0 +1,48 @@
+# One-GPU smoke test: torch.profiler exports a Chrome trace on ROCm/MI300X.
+#
+#   kubectl apply -f k8s/job-verify-torch-profiler.yaml
+#   kubectl logs -n default -f job/iclr-verify-torch-profiler
+#
+# Trace is written under TORCH_PROFILER_DIR in the container (ephemeral). To keep it,
+# kubectl cp default/<pod>:/tmp/torch_profiler_verify/verify-chrome-trace.json ./
+#
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: iclr-verify-torch-profiler
+  namespace: default
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 7200
+  template:
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        doks.digitalocean.com/gpu-brand: amd
+      tolerations:
+        - key: amd.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: verify
+          image: rocm/pytorch:rocm7.2.1_ubuntu24.04_py3.12_pytorch_release_2.9.1
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -eux
+              apt-get update -qq && apt-get install -y -qq git
+              mkdir -p /workspace && cd /workspace
+              git clone --depth 1 -b submission-wip-status \
+                https://github.com/fmgreco/iclr-2026.git repo
+              cd repo
+              export TORCH_PROFILER_DIR=/tmp/torch_profiler_verify
+              python3 scripts/verify_torch_profiler.py
+          env:
+            - name: TORCH_PROFILER_DIR
+              value: "/tmp/torch_profiler_verify"
+          resources:
+            limits:
+              amd.com/gpu: "1"
+            requests:
+              amd.com/gpu: "1"

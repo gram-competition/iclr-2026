@@ -154,6 +154,57 @@ def _get_cuda_memory_stats(device: torch.device) -> dict[str, float]:
     }
 
 
+def _make_ddp_step_profiler(rank: int, local_rank: int) -> torch.profiler.profile | None:
+    """Optional training-step profiler for sync / kernel analysis (multi-GPU safe).
+
+    Enable with environment variables (all ranks run the same schedule; each rank
+    writes its own trace file):
+
+      TORCH_PROFILER_ACTIVE=8     # number of *optimizer* steps to record (after warmup)
+      TORCH_PROFILER_WARMUP=2     # optimizer steps in warmup (default 2)
+      TORCH_PROFILER_DIR=/tmp/pf  # output directory (default /tmp/torch_profiler)
+
+    Chrome traces: trace-chrome-r<rank>-l<local_rank>.json
+    """
+    active = int(os.environ.get("TORCH_PROFILER_ACTIVE", "0"))
+    if active <= 0:
+        return None
+    warmup = max(0, int(os.environ.get("TORCH_PROFILER_WARMUP", "2")))
+    out_root = Path(os.environ.get("TORCH_PROFILER_DIR", "/tmp/torch_profiler"))
+    out_root.mkdir(parents=True, exist_ok=True)
+    trace_path = out_root / f"trace-chrome-r{rank}-l{local_rank}.json"
+
+    def on_trace_ready(p: torch.profiler.profile) -> None:
+        p.export_chrome_trace(str(trace_path))
+        if rank == 0:
+            print(f"[torch.profiler] Chrome trace: {trace_path}", flush=True)
+            try:
+                print(
+                    p.key_averages().table(
+                        sort_by="cuda_time_total",
+                        row_limit=25,
+                    ),
+                    flush=True,
+                )
+            except Exception as exc:
+                print(f"[torch.profiler] key_averages table failed: {exc}", flush=True)
+
+    return torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        schedule=torch.profiler.schedule(
+            wait=0,
+            warmup=warmup,
+            active=active,
+            repeat=1,
+        ),
+        on_trace_ready=on_trace_ready,
+        with_stack=False,
+    )
+
+
 def _initialise_wandb_run(
     args: argparse.Namespace,
     *,
@@ -244,8 +295,9 @@ def _save_training_checkpoint(
     scheduler: object,
     scaler: torch.amp.GradScaler,
     epoch: int,
-    best_val_metric: float,
+    best_val_score: float,
     args: argparse.Namespace,
+    best_checkpoint_metric: str | None = None,
 ) -> None:
     payload = {
         "model_state_dict": _model_state_dict_for_checkpoint(model),
@@ -253,13 +305,16 @@ def _save_training_checkpoint(
         "scheduler_state_dict": scheduler.state_dict() if hasattr(scheduler, "state_dict") else None,
         "scaler_state_dict": scaler.state_dict(),
         "epoch": epoch,
-        "best_val_metric": best_val_metric,
+        "best_val_score": best_val_score,
+        "best_val_metric": best_val_score,
         "args": vars(args),
         "torch_rng_state": torch.get_rng_state(),
         "cuda_rng_state_all": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
         "numpy_rng_state": np.random.get_state(),
         "python_rng_state": random.getstate(),
     }
+    if best_checkpoint_metric is not None:
+        payload["best_checkpoint_metric"] = best_checkpoint_metric
     torch.save(payload, path)
 
 
@@ -503,6 +558,7 @@ def train(args: argparse.Namespace) -> None:
             use_relative_velocity_inputs=bool(
                 getattr(args, "use_relative_velocity_inputs", False)
             ),
+            use_t_embedding=bool(getattr(args, "use_t_embedding", True)),
             load_bundled_weights=bool(getattr(args, "load_bundled_weights", True)),
         ).to(device)
     else:
@@ -522,6 +578,11 @@ def train(args: argparse.Namespace) -> None:
                 print(
                     "SpatioTemporalGNN: pressure node features enabled "
                     f"(relative Δv inputs={getattr(st, 'use_relative_velocity_inputs', False)})"
+                )
+            if getattr(st, "use_t_embedding", True):
+                print(
+                    "SpatioTemporalGNN: global t embedding enabled "
+                    f"(t_dim={getattr(st, 't_dim', 10)}, t_embed_dim={getattr(st, 't_embed_dim', 32)})"
                 )
         if resolved_model_name == "spatiotemporal_mno":
             print(
@@ -632,6 +693,25 @@ def train(args: argparse.Namespace) -> None:
     scheduler = training.scheduler
     loss_fn = training.loss_fn
 
+    best_checkpoint_metric = str(
+        getattr(args, "best_checkpoint_metric", "hint")
+    ).lower()
+    if best_checkpoint_metric not in {"hint", "rl2", "rl2_gap"}:
+        raise ValueError(
+            "--best-checkpoint-metric must be one of hint, rl2, rl2_gap; "
+            f"got {best_checkpoint_metric!r}"
+        )
+    tw_power = float(getattr(args, "rl2_time_weight_power", 0.0))
+    train_time_weights: torch.Tensor | None = None
+    if tw_power > 0.0:
+        w = torch.arange(1, NUM_T_OUT + 1, dtype=torch.float32).pow(tw_power)
+        train_time_weights = w / w.sum()
+        if rank == 0:
+            print(
+                f"Training loss time weights (1..T)^{tw_power} normalised: "
+                f"{train_time_weights.tolist()}"
+            )
+
     project_root = Path(__file__).resolve().parents[2]
     checkpoint_path = Path(args.checkpoint_path)
     if not checkpoint_path.is_absolute():
@@ -715,13 +795,38 @@ def train(args: argparse.Namespace) -> None:
         )
 
     try:
-        best_val_metric = float(resume_checkpoint.get("best_val_metric", float("inf")))
+        best_score = float(
+            resume_checkpoint.get(
+                "best_val_score",
+                resume_checkpoint.get("best_val_metric", float("inf")),
+            )
+        )
+        saved_crit = resume_checkpoint.get("best_checkpoint_metric")
+        if (
+            isinstance(saved_crit, str)
+            and saved_crit.lower() != best_checkpoint_metric
+            and resume_checkpoint
+        ):
+            best_score = float("inf")
+            if rank == 0:
+                print(
+                    f"best checkpoint metric changed ({saved_crit!r} -> {best_checkpoint_metric!r}); "
+                    "resetting best-score tracker."
+                )
         if resume_from_path is not None and not resume_checkpoint:
             if distributed:
                 dist.barrier()
             resumed_val_metric = 0.0
             if rank == 0:
-                _, resumed_val_metric, _, _, _ = evaluate(
+                (
+                    resumed_rl2,
+                    resumed_hint,
+                    _,
+                    resumed_p_rl2,
+                    _,
+                    _,
+                    _,
+                ) = evaluate(
                     _eval_module(model),
                     val_loader,
                     loss_fn,
@@ -732,7 +837,13 @@ def train(args: argparse.Namespace) -> None:
                     use_sobolev=use_sobolev,
                     wall_distance_loss_alpha=wall_distance_loss_alpha,
                 )
-                best_val_metric = resumed_val_metric
+                if best_checkpoint_metric == "hint":
+                    best_score = resumed_hint
+                elif best_checkpoint_metric == "rl2":
+                    best_score = resumed_rl2
+                else:
+                    best_score = resumed_rl2 - resumed_p_rl2
+                resumed_val_metric = resumed_hint
                 # Seed checkpoint_path so test-time loading always has a valid artifact,
                 # even if continuation does not improve on resumed validation metric.
                 _save_training_checkpoint(
@@ -742,8 +853,9 @@ def train(args: argparse.Namespace) -> None:
                     scheduler=scheduler,
                     scaler=scaler,
                     epoch=0,
-                    best_val_metric=best_val_metric,
+                    best_val_score=best_score,
                     args=args,
+                    best_checkpoint_metric=best_checkpoint_metric,
                 )
                 _save_training_checkpoint(
                     run_checkpoint_path,
@@ -752,12 +864,13 @@ def train(args: argparse.Namespace) -> None:
                     scheduler=scheduler,
                     scaler=scaler,
                     epoch=0,
-                    best_val_metric=best_val_metric,
+                    best_val_score=best_score,
                     args=args,
+                    best_checkpoint_metric=best_checkpoint_metric,
                 )
                 print(
-                    "Resume mode: initialized best val hint metric from loaded checkpoint "
-                    f"to {best_val_metric:.6f}."
+                    "Resume mode: initialized best validation score "
+                    f"({best_checkpoint_metric}) from loaded weights: {best_score:.6f}."
                 )
                 print(f"Seeded checkpoint path with resumed weights: {checkpoint_path}")
                 if wandb_run is not None:
@@ -766,6 +879,20 @@ def train(args: argparse.Namespace) -> None:
                 dist.barrier()
 
         for epoch in range(start_epoch, training.epochs + 1):
+            step_profiler: torch.profiler.profile | None = None
+            prof_steps = int(os.environ.get("TORCH_PROFILER_ACTIVE", "0"))
+            if prof_steps > 0 and epoch == start_epoch:
+                step_profiler = _make_ddp_step_profiler(rank, local_rank)
+                if step_profiler is not None:
+                    if rank == 0:
+                        print(
+                            "[torch.profiler] "
+                            f"ACTIVE(opt_steps)={prof_steps} "
+                            f"WARMUP={os.environ.get('TORCH_PROFILER_WARMUP', '2')} "
+                            f"DIR={os.environ.get('TORCH_PROFILER_DIR', '/tmp/torch_profiler')}",
+                            flush=True,
+                        )
+                    step_profiler.start()
             if train_sampler is not None:
                 train_sampler.set_epoch(epoch)
             model.train()
@@ -818,6 +945,13 @@ def train(args: argparse.Namespace) -> None:
                         baseline = velocity_in[:, -1:, :, :]
                         pred_loss = pred_scaled - baseline
                         tgt_loss = velocity_out - baseline
+                    tw = (
+                        None
+                        if train_time_weights is None
+                        else train_time_weights.to(
+                            device=pred_scaled.device, dtype=pred_scaled.dtype
+                        )
+                    )
                     if use_sobolev:
                         direct_loss = loss_fn(
                             pred_loss,
@@ -825,10 +959,14 @@ def train(args: argparse.Namespace) -> None:
                             knn_indices=knn_indices,
                             pos=pos,
                             wall_weights=wall_weights,
+                            time_weights=tw,
                         )
                     else:
                         direct_loss = loss_fn(
-                            pred_loss, tgt_loss, wall_weights=wall_weights
+                            pred_loss,
+                            tgt_loss,
+                            wall_weights=wall_weights,
+                            time_weights=tw,
                         )
                     if divergence_loss_lambda > 0.0:
                         from models.fmgreco_stnn.graph_utils import knn_flux_divergence_loss
@@ -933,6 +1071,15 @@ def train(args: argparse.Namespace) -> None:
                     )
                     train_metric += hint_metric(pred_unscaled, target_unscaled).item()
 
+                if step_profiler is not None and should_step:
+                    step_profiler.step()
+
+            if step_profiler is not None:
+                step_profiler.stop()
+                if rank == 0:
+                    print("[torch.profiler] finished (first-epoch capture)", flush=True)
+                step_profiler = None
+
             nb_local = max(1, len(train_loader))
             stats_t = torch.tensor(
                 [train_loss, train_metric, float(nb_local)],
@@ -949,8 +1096,18 @@ def train(args: argparse.Namespace) -> None:
                 dist.barrier()
             avg_val_loss = 0.0
             avg_val_metric = 0.0
+            val_persist_rl2 = 0.0
+            val_persist_hint = 0.0
             if rank == 0:
-                avg_val_loss, avg_val_metric, _, _, _ = evaluate(
+                (
+                    avg_val_loss,
+                    avg_val_metric,
+                    _,
+                    val_persist_rl2,
+                    val_persist_hint,
+                    _,
+                    _,
+                ) = evaluate(
                     _eval_module(model),
                     val_loader,
                     loss_fn,
@@ -963,13 +1120,24 @@ def train(args: argparse.Namespace) -> None:
                 )
             if distributed:
                 val_t = torch.tensor(
-                    [avg_val_loss, avg_val_metric],
+                    [avg_val_loss, avg_val_metric, val_persist_rl2, val_persist_hint],
                     device=device,
                     dtype=torch.float64,
                 )
                 dist.broadcast(val_t, src=0)
-                avg_val_loss, avg_val_metric = val_t[0].item(), val_t[1].item()
+                avg_val_loss = val_t[0].item()
+                avg_val_metric = val_t[1].item()
+                val_persist_rl2 = val_t[2].item()
+                val_persist_hint = val_t[3].item()
                 dist.barrier()
+
+            val_rl2_gap = avg_val_loss - val_persist_rl2
+            if best_checkpoint_metric == "hint":
+                score = avg_val_metric
+            elif best_checkpoint_metric == "rl2":
+                score = avg_val_loss
+            else:
+                score = val_rl2_gap
 
             current_lr = scheduler.get_last_lr()[0]
             cuda_memory_stats: dict[str, float | None]
@@ -999,8 +1167,8 @@ def train(args: argparse.Namespace) -> None:
                     )
                 )
 
-            if avg_val_metric < best_val_metric:
-                best_val_metric = avg_val_metric
+            if score < best_score:
+                best_score = score
                 if rank == 0:
                     _save_training_checkpoint(
                         checkpoint_path,
@@ -1009,8 +1177,9 @@ def train(args: argparse.Namespace) -> None:
                         scheduler=scheduler,
                         scaler=scaler,
                         epoch=epoch,
-                        best_val_metric=best_val_metric,
+                        best_val_score=best_score,
                         args=args,
+                        best_checkpoint_metric=best_checkpoint_metric,
                     )
                     _save_training_checkpoint(
                         run_checkpoint_path,
@@ -1019,8 +1188,9 @@ def train(args: argparse.Namespace) -> None:
                         scheduler=scheduler,
                         scaler=scaler,
                         epoch=epoch,
-                        best_val_metric=best_val_metric,
+                        best_val_score=best_score,
                         args=args,
+                        best_checkpoint_metric=best_checkpoint_metric,
                     )
             if rank == 0:
                 _save_training_checkpoint(
@@ -1030,8 +1200,9 @@ def train(args: argparse.Namespace) -> None:
                     scheduler=scheduler,
                     scaler=scaler,
                     epoch=epoch,
-                    best_val_metric=best_val_metric,
+                    best_val_score=best_score,
                     args=args,
+                    best_checkpoint_metric=best_checkpoint_metric,
                 )
             # Rank 0 alone runs checkpoint I/O above; other ranks must not enter the next
             # epoch's training (DDP all-reduces) until rank 0 finishes, or NCCL will hang.
@@ -1045,6 +1216,9 @@ def train(args: argparse.Namespace) -> None:
                     f"train_hint_unscaled={avg_train_metric:.6f} | "
                     f"val_rl2_scaled={avg_val_loss:.6f} | "
                     f"val_hint_unscaled={avg_val_metric:.6f} | "
+                    f"val_persist_rl2={val_persist_rl2:.6f} | "
+                    f"val_rl2_gap={val_rl2_gap:+.6f} | "
+                    f"best_{best_checkpoint_metric}={best_score:.6f} | "
                     f"lr={current_lr:.6e}"
                 )
                 if device.type == "cuda":
@@ -1056,8 +1230,11 @@ def train(args: argparse.Namespace) -> None:
                             "train_hint_unscaled": avg_train_metric,
                             "val_rl2_scaled": avg_val_loss,
                             "val_hint_unscaled": avg_val_metric,
+                            "val_persist_rl2_scaled": val_persist_rl2,
+                            "val_persist_hint_unscaled": val_persist_hint,
+                            "val_rl2_gap_vs_persistence": val_rl2_gap,
                             "lr": current_lr,
-                            "best_val_hint_unscaled": best_val_metric,
+                            f"best_val_{best_checkpoint_metric}": best_score,
                             **{
                                 key: value
                                 for key, value in cuda_memory_stats.items()
@@ -1068,7 +1245,10 @@ def train(args: argparse.Namespace) -> None:
                     )
 
         if rank == 0:
-            print(f"Best val hint metric (unscaled): {best_val_metric:.6f}")
+            print(
+                f"Best validation score ({best_checkpoint_metric}, lower is better): "
+                f"{best_score:.6f}"
+            )
             print(f"Saved best checkpoint to: {checkpoint_path}")
             print(f"Saved run checkpoint to: {run_checkpoint_path}")
             print(f"Saved latest training-state checkpoint to: {latest_checkpoint_path}")
@@ -1089,7 +1269,7 @@ def train(args: argparse.Namespace) -> None:
             best_checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
             _load_model_state_from_checkpoint(model, best_checkpoint)
             if test_files:
-                test_loss, test_metric, _, p_rl2, p_hint = run_full_test_inference(
+                test_loss, test_metric, _, p_rl2, p_hint, _, _ = run_full_test_inference(
                     _eval_module(model),
                     test_files,
                     loss_fn,
@@ -1389,12 +1569,41 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--use-t-embedding",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "SpatioTemporalGNN: embed the global time tensor t (B, 10) with a small MLP and "
+            "concatenate to each node, matching the public competition signature. Use "
+            "--no-use-t-embedding to load or compare with older checkpoints that ignored t."
+        ),
+    )
+    parser.add_argument(
         "--train-loss-on-velocity-delta",
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
             "Training only: minimize RL2/Sobolev on (prediction - v_last) vs (target - v_last) in scaled space. "
             "Validation and test still use full-field RL2 for leaderboard-aligned metrics."
+        ),
+    )
+    parser.add_argument(
+        "--best-checkpoint-metric",
+        type=str,
+        default="hint",
+        choices=("hint", "rl2", "rl2_gap"),
+        help=(
+            "Metric to minimize when saving best.pt: val HINT (unscaled), val scaled RL2, "
+            "or val RL2 minus persistence RL2 (negative means beating persistence on RL2)."
+        ),
+    )
+    parser.add_argument(
+        "--rl2-time-weight-power",
+        type=float,
+        default=0.0,
+        help=(
+            "If > 0, training RL2/Sobolev averages per-output-timestep losses with weights "
+            "∝ (1..T_out)^power (normalized). 0 = uniform (default)."
         ),
     )
     parser.add_argument(
