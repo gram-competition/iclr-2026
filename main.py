@@ -19,10 +19,11 @@ for path in glob("/workspace/data/warped-ifw-test-set/*.npz"):
     idcs_airfoil.append(torch.from_numpy(sample["idcs_airfoil"]))
     velocity_in.append(sample["velocity_in"])
     ground_truth.append(sample["velocity_out"])
-t = torch.from_numpy(np.stack(t))
-pos = torch.from_numpy(np.stack(pos))
-velocity_in = torch.from_numpy(np.stack(velocity_in))
-ground_truth = torch.from_numpy(np.stack(ground_truth))
+t = torch.from_numpy(np.stack(t)).to(device)
+pos = torch.from_numpy(np.stack(pos)).to(device)
+idcs_airfoil = [i.to(device) for i in idcs_airfoil]
+velocity_in = torch.from_numpy(np.stack(velocity_in)).to(device)
+ground_truth = torch.from_numpy(np.stack(ground_truth)).to(device)
 
 # Dimensions of the data
 BATCH_SIZE = 15  # indicative per-call batch; held-out test split has 95 samples total
