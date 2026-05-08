@@ -26,7 +26,7 @@ velocity_in = torch.from_numpy(np.stack(velocity_in)).to(device)
 ground_truth = torch.from_numpy(np.stack(ground_truth)).to(device)
 
 # Dimensions of the data
-BATCH_SIZE = 15  # indicative per-call batch; held-out test split has 95 samples total
+BATCH_SIZE = 95  # indicative per-call batch; held-out test split has 95 samples total
 NUM_T_IN = 5  # number of time points in the input
 NUM_T_OUT = 5  # number of time points in the output
 NUM_POS = 100000  # number of points in space
