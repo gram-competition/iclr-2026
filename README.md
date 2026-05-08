@@ -4,7 +4,11 @@
 [![](https://img.shields.io/badge/Website-GRaM_competition-teal)](https://gram-competition.github.io)
 [![](https://img.shields.io/badge/Hugging_Face-Dataset-yellow)](https://huggingface.co/datasets/gram-competition/warped-ifw)
 
-<img src=".logos/beyondmath.svg" height="60vw">&nbsp;&nbsp;&nbsp;<img src=".logos/mcml.svg" height="60vw">
+<p align="center">
+  <img src=".logos/beyondmath.svg" height="60vw">
+  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  <img src=".logos/mcml.svg" height="60vw">
+</p>
 
 This repository functions as submission portal for the competition hosted in conjunction with the Workshop on Geometry-grounded Representation Learning and Generative Modeling (GRaM) at ICLR 2026.
 For description of the challenge refer to the competition website (link above).
