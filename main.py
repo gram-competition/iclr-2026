@@ -12,7 +12,7 @@ device = next(model.parameters()).device
 
 # Load test split
 t, pos, idcs_airfoil, velocity_in, ground_truth = [], [], [], [], []
-for path in glob("warped-ifw-test-split/*.npz"):
+for path in glob("/workspace/data/warped-ifw-test-set/*.npz"):
     sample = np.load(path)
     t.append(sample["t"])
     pos.append(sample["pos"])
