@@ -93,7 +93,7 @@ hyperparameters are picked up automatically.
 
 ## Dependencies
 
-- PyTorch (any recent version that supports `torch.load(..., weights_only=False)`)
+- PyTorch
 - NumPy
 - SciPy (for `cKDTree`)
 
