@@ -1,0 +1,19 @@
+{
+  "repo_id": "fortybyte/ifw-submission-assets",
+  "pairs": [
+    {
+      "alpha": 0.8,
+      "members": [
+        "m1",
+        "m2"
+      ]
+    },
+    {
+      "alpha": 0.2,
+      "members": [
+        "m3",
+        "m4"
+      ]
+    }
+  ]
+}
