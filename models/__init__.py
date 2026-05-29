@@ -11,6 +11,7 @@ from .harshitsinghsnu import ImprovedMLP
 from .kagent import Kagent
 from .levers_tail_submission import LeversTailV2Submission
 from .mlp import MLP
+from .transolver_ar import TransolverAR
 from .perceiver_flow import PerceiverFlow
 from .smoothsplatnet import SmoothSplatNet
 from .submission_model import SubmissionModel
