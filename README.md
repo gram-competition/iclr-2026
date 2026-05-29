@@ -4,7 +4,11 @@
 [![](https://img.shields.io/badge/Website-GRaM_competition-teal)](https://gram-competition.github.io)
 [![](https://img.shields.io/badge/Hugging_Face-Dataset-yellow)](https://huggingface.co/datasets/gram-competition/warped-ifw)
 
-<img src=".logos/beyondmath.svg" height="60vw">&nbsp;&nbsp;&nbsp;<img src=".logos/mcml.svg" height="60vw">
+<p align="center">
+  <img src=".logos/beyondmath.svg" height="60vw">
+  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  <img src=".logos/mcml.svg" height="60vw">
+</p>
 
 This repository functions as submission portal for the competition hosted in conjunction with the Workshop on Geometry-grounded Representation Learning and Generative Modeling (GRaM) at ICLR 2026.
 For description of the challenge refer to the competition website (link above).
@@ -46,7 +50,7 @@ It is fine if your model depends on external libraries (xFormers, your own, etc.
 Provide **model weights** along with your pull request, either by uploading to the directory `models/<model name>/` or via download link if their file size would be too large.
 Your model must load the weights during construction.
 
-Create an **import entry** in `models/__init__.py` that imports you model's constructor from `models/<model name>/`.
+Create an **import entry** in `models/__init__.py` that imports your model's constructor from `models/<model name>/`.
 
 *Optional:* provide a Markdown file under `models/<model name>/` detailing your training process and other important information to reproduce your approach.
 

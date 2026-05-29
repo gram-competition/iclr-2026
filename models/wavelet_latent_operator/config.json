@@ -1,0 +1,35 @@
+{
+    "scattering_config": {
+        "grid_size": 48,
+        "padding": 0.05,
+        "smooth_sigma": 0.8,
+        "j": 3,
+        "l": 3,
+        "sigma_0": 2.0,
+        "max_order": 2,
+        "integral_powers": [
+            0.5,
+            1.0,
+            2.0,
+            4.0
+        ],
+        "map_pooled_size": 12,
+        "use_canonical_bounds": true,
+        "velocity_channel_mixing": [
+            "vx",
+            "vy",
+            "vz",
+            "speed"
+        ]
+    },
+    "geom_scattering_dim": 164,
+    "latent_dim": 64,
+    "depth": 4,
+    "point_hidden_dim": 160,
+    "decoder_hidden_dim": 160,
+    "use_repeat_last_baseline": true,
+    "zero_airfoil": true,
+    "relative_loss_weight": 0.2,
+    "delta_loss_weight": 0.05,
+    "weights_path": "state_dict.pt"
+}
