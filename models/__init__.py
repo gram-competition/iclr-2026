@@ -1,5 +1,6 @@
 from .ensemble_spatiotemporal_models import EnsembleSpatioTemporalModels
 from .mlp import MLP
+from .delta_graph import DeltaGraph
 from .zonal_moe.wrapper import Model as ZonalMoe
 from .ab_upt import ABUPT
 from .vrt_ensemble import VRTEnsemble
