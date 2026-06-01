@@ -4,12 +4,14 @@ import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
-from models.mlp.model import (
+from .components import (
     HAS_TORCH_CLUSTER,
     FourierTimeEmbedding,
-    MLP as BaselineMLP,
     MNOBlock,
     _make_mlp,
+    build_airfoil_mask,
+    compute_surface_frame,
+    compute_wall_distance,
     torch_cluster_knn_graph,
 )
 
@@ -141,7 +143,7 @@ class SpatiotemporalMNO(nn.Module):
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        return BaselineMLP._build_airfoil_mask(
+        return build_airfoil_mask(
             idcs_airfoil,
             batch_size,
             num_pos,
@@ -154,14 +156,14 @@ class SpatiotemporalMNO(nn.Module):
         pos: torch.Tensor,
         idcs_airfoil: list[torch.Tensor],
     ) -> torch.Tensor:
-        return BaselineMLP._compute_wall_distance(pos, idcs_airfoil)
+        return compute_wall_distance(pos, idcs_airfoil)
 
     @staticmethod
     def _compute_surface_frame(
         pos: torch.Tensor,
         idcs_airfoil: list[torch.Tensor],
     ) -> torch.Tensor:
-        return BaselineMLP._compute_surface_frame(pos, idcs_airfoil)
+        return compute_surface_frame(pos, idcs_airfoil)
 
     @staticmethod
     def _pad_neighbors(indices: torch.Tensor, target_k: int) -> torch.Tensor:
