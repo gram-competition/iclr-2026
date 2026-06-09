@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn as nn
-from torch.utils.checkpoint import checkpoint
 
 from .components import (
     HAS_TORCH_CLUSTER,
@@ -17,16 +18,13 @@ from .components import (
 
 
 class SpatiotemporalMNO(nn.Module):
-    """Spatial MNO encoder + latent temporal forecaster + spatial decoder.
+    """Encoder-MNO-Decoder model for CFD on unstructured 3D point clouds.
 
-    The model factorises the problem into:
-    1. per-timestep spatial encoding on the point cloud,
-    2. per-point temporal forecasting in latent space, and
-    3. future spatial refinement + decoding back to velocity residuals.
-
-    This keeps the MNO blocks responsible for geometry-aware spatial mixing
-    while replacing the baseline's flattened-history treatment of time with an
-    explicit latent sequence model.
+    This is the basic Multiscale Neural Operator used for the submission: the
+    full velocity history is flattened into a per-point feature vector, encoded,
+    mixed by a stack of geometry-aware MNO blocks, and decoded to a residual
+    around a persistence baseline. (An earlier GRU-based latent-temporal variant
+    lived here but was not used for the submission.)
     """
 
     def __init__(
@@ -43,7 +41,9 @@ class SpatiotemporalMNO(nn.Module):
         knn_query_chunk_size: int = 1024,
         graph_query_chunk_size: int = 2048,
         use_torch_cluster_knn: bool = True,
-        temporal_layers: int = 2,
+        load_pretrained: bool = True,
+        # Accepted for trainer compatibility; the basic MNO is light enough that
+        # activation checkpointing is unnecessary, so the flag is a no-op here.
         activation_checkpointing: bool = False,
     ):
         super().__init__()
@@ -58,33 +58,28 @@ class SpatiotemporalMNO(nn.Module):
         self.output_channels = output_channels
         self.knn_query_chunk_size = knn_query_chunk_size
         self.use_torch_cluster_knn = use_torch_cluster_knn and HAS_TORCH_CLUSTER
-        self.activation_checkpointing = activation_checkpointing
 
+        # Fourier time embedding: each of the (num_t_in + num_t_out) timestamps
+        # is mapped to 2*num_time_freqs sinusoidal features, replacing raw scalars.
         num_time_freqs = 16
         self.time_embedding = FourierTimeEmbedding(num_freqs=num_time_freqs)
-        time_feat_dim = self.time_embedding.out_dim
+        time_feat_dim = (num_t_in + num_t_out) * self.time_embedding.out_dim
 
-        # Current frame velocity + geometry/context features.
-        encoder_in_dim = 3 + 3 + time_feat_dim + 1 + 1 + 9
-        self.frame_encoder = _make_mlp(
-            encoder_in_dim,
-            2 * latent_dim,
-            latent_dim,
-        )
-        self.temporal_input_proj = _make_mlp(
-            time_feat_dim,
-            latent_dim,
-            latent_dim,
-            num_hidden_layers=1,
-        )
-        self.future_time_proj = _make_mlp(
-            time_feat_dim,
+        # Per-output-step horizon embedding: tells the decoder *which* future
+        # step it is reconstructing so each output frame is time-aware.
+        self.horizon_mlp = _make_mlp(
+            self.time_embedding.out_dim,
             latent_dim,
             latent_dim,
             num_hidden_layers=1,
         )
 
-        self.encoder_blocks = nn.ModuleList(
+        # +1 for binary airfoil mask, +1 for continuous wall distance (SDF),
+        # +9 for local surface coordinate frame (normal + 2 tangent vectors).
+        aux_dim = (num_t_in * 3) + time_feat_dim + 1 + 1 + 9
+        self.encoder = _make_mlp(3 + aux_dim, 2 * latent_dim, latent_dim)
+
+        self.blocks = nn.ModuleList(
             [
                 MNOBlock(
                     latent_dim=latent_dim,
@@ -95,44 +90,45 @@ class SpatiotemporalMNO(nn.Module):
                 )
                 for _ in range(num_blocks)
             ]
-        )
-        self.forecast_blocks = nn.ModuleList(
-            [
-                MNOBlock(
-                    latent_dim=latent_dim,
-                    num_modes=num_modes,
-                    num_heads=num_heads,
-                    k=k,
-                    graph_query_chunk_size=graph_query_chunk_size,
-                )
-                for _ in range(num_blocks)
-            ]
-        )
-
-        self.temporal_input_norm = nn.LayerNorm(latent_dim)
-        self.temporal_model = nn.GRU(
-            input_size=latent_dim,
-            hidden_size=latent_dim,
-            num_layers=max(1, temporal_layers),
-            batch_first=True,
-        )
-        self.temporal_output_norm = nn.LayerNorm(latent_dim)
-        self.temporal_predictor = _make_mlp(
-            num_t_in * latent_dim,
-            2 * latent_dim,
-            num_t_out * latent_dim,
         )
 
         self.decoder = _make_mlp(
             latent_dim,
             2 * latent_dim,
-            output_channels,
+            num_t_out * output_channels,
         )
 
+        # Initialize residual head to zero so the model starts exactly at the
+        # persistence baseline: pred = last_input + 0.
         final_layer = self.decoder[-1]
         if isinstance(final_layer, nn.Linear):
             nn.init.zeros_(final_layer.weight)
             nn.init.zeros_(final_layer.bias)
+
+        if load_pretrained:
+            self._load_pretrained_weights()
+
+    def _load_pretrained_weights(self) -> None:
+        """Load packaged weights from ``state_dict.pt`` if present.
+
+        Mirrors the convention used by the other self-contained submissions: the
+        trained ``state_dict.pt`` ships alongside this file and is loaded
+        automatically at construction time. If it is absent (e.g. during a fresh
+        training run before any checkpoint exists) the model keeps its random
+        initialisation.
+        """
+        weights_path = os.path.join(os.path.dirname(__file__), "state_dict.pt")
+        if os.path.isfile(weights_path):
+            state = torch.load(weights_path, map_location="cpu", weights_only=True)
+            if isinstance(state, dict) and "model_state_dict" in state:
+                state = state["model_state_dict"]
+            self.load_state_dict(state)
+            print(f"[SpatiotemporalMNO] Loaded weights from {weights_path}")
+        else:
+            print(
+                "[SpatiotemporalMNO] No state_dict.pt found next to model.py — "
+                "using random initialisation"
+            )
 
     @staticmethod
     def _build_airfoil_mask(
@@ -226,24 +222,6 @@ class SpatiotemporalMNO(nn.Module):
             return self._knn_torch_cluster(pos)
         return self._knn_cdist(pos)
 
-    def _run_spatial_stack(
-        self,
-        x: torch.Tensor,
-        pos: torch.Tensor,
-        knn_indices: torch.Tensor,
-        blocks: nn.ModuleList,
-    ) -> torch.Tensor:
-        for block in blocks:
-            if self.activation_checkpointing and self.training:
-                x = checkpoint(
-                    lambda x_in: block(x_in, pos, knn_indices),
-                    x,
-                    use_reentrant=False,
-                )
-            else:
-                x = block(x, pos, knn_indices)
-        return x
-
     def forward(
         self,
         t: torch.Tensor,
@@ -271,10 +249,32 @@ class SpatiotemporalMNO(nn.Module):
                 "idcs_airfoil must contain one index tensor per batch element."
             )
 
-        time_emb = self.time_embedding(t)
-        input_time_emb = time_emb[:, : self.num_t_in, :]
-        output_time_emb = time_emb[:, self.num_t_in :, :]
+        # Auto-normalize: when called via the submission signature (no mean/std),
+        # compute per-sample stats from velocity_in — identical to dataset.py —
+        # and unscale the output before returning so callers get physical velocities.
+        _auto_normalized = False
+        if velocity_mean is None or velocity_std is None:
+            with torch.no_grad():
+                # Mean/std over time and spatial dims: (B,1,1,3) matching dataset.py
+                velocity_mean_local = velocity_in.mean(dim=(1, 2), keepdim=True)
+                velocity_std_local = velocity_in.std(
+                    dim=(1, 2), unbiased=False, keepdim=True
+                ).clamp_min(1e-6)
+            velocity_in = (velocity_in - velocity_mean_local) / velocity_std_local
+            velocity_mean = velocity_mean_local.squeeze(1).squeeze(1)  # (B, 3)
+            velocity_std = velocity_std_local.squeeze(1).squeeze(1)  # (B, 3)
+            _auto_normalized = True
 
+        velocity_feat = velocity_in.permute(0, 2, 1, 3).reshape(
+            batch_size,
+            num_pos,
+            num_t_in * 3,
+        )
+        # Fourier-embed each timestamp and flatten across the time axis.
+        # t: (B, T_total) -> (B, T_total, 2*num_freqs) -> (B, T_total * 2*num_freqs)
+        time_emb = self.time_embedding(t)  # (B, T_total, 2F)
+        time_feat = time_emb.reshape(batch_size, -1)  # (B, T_total * 2F)
+        time_feat = time_feat.unsqueeze(1).expand(-1, num_pos, -1)  # (B, N, T_total*2F)
         airfoil_mask = self._build_airfoil_mask(
             idcs_airfoil,
             batch_size,
@@ -285,78 +285,65 @@ class SpatiotemporalMNO(nn.Module):
 
         with torch.no_grad():
             if wall_distance is not None:
+                # Use precomputed raw wall distance (from dataset).
+                # wall_distance shape: (B, N) -> apply log1p and unsqueeze.
                 wall_distance_feat = torch.log1p(wall_distance).unsqueeze(-1)
             else:
+                # Inference on unseen data: compute on the fly.
                 wall_distance_feat = self._compute_wall_distance(pos, idcs_airfoil)
 
             if surface_frame is not None:
+                # Precomputed from dataset: (B, N, 9)
                 surface_frame_feat = surface_frame
             else:
+                # Inference on unseen data: compute on the fly.
                 surface_frame_feat = self._compute_surface_frame(pos, idcs_airfoil)
 
-            if knn_indices is None:
+        encoder_input = torch.cat(
+            (
+                pos,
+                velocity_feat,
+                time_feat,
+                airfoil_mask,
+                wall_distance_feat,
+                surface_frame_feat,
+            ),
+            dim=-1,
+        )
+        x = self.encoder(encoder_input)
+
+        if knn_indices is None:
+            with torch.no_grad():
                 knn_indices = self._build_knn_graph(pos)
 
-        encoded_history: list[torch.Tensor] = []
-        for step_idx in range(self.num_t_in):
-            step_time_feat = input_time_emb[:, step_idx, :].unsqueeze(1).expand(
-                -1,
-                num_pos,
-                -1,
-            )
-            encoder_input = torch.cat(
-                (
-                    pos,
-                    velocity_in[:, step_idx, :, :],
-                    step_time_feat,
-                    airfoil_mask,
-                    wall_distance_feat,
-                    surface_frame_feat,
-                ),
-                dim=-1,
-            )
-            x = self.frame_encoder(encoder_input)
-            x = self._run_spatial_stack(x, pos, knn_indices, self.encoder_blocks)
-            encoded_history.append(x)
+        for block in self.blocks:
+            x = block(x, pos, knn_indices)
 
-        latent_history = torch.stack(encoded_history, dim=1)  # (B, T_in, N, D)
-        temporal_bias = self.temporal_input_proj(input_time_emb).unsqueeze(1)
-        temporal_input = latent_history.permute(0, 2, 1, 3)  # (B, N, T_in, D)
-        temporal_input = self.temporal_input_norm(temporal_input + temporal_bias)
-        temporal_input = temporal_input.reshape(
-            batch_size * num_pos,
-            self.num_t_in,
-            self.latent_dim,
-        )
-
-        temporal_output, _ = self.temporal_model(temporal_input)
-        temporal_output = self.temporal_output_norm(temporal_output)
-        temporal_summary = temporal_output.reshape(
-            batch_size,
-            num_pos,
-            self.num_t_in * self.latent_dim,
-        )
-        future_latent = self.temporal_predictor(temporal_summary).view(
+        decoded = self.decoder(x)
+        residual = decoded.view(
             batch_size,
             num_pos,
             self.num_t_out,
-            self.latent_dim,
-        ).permute(0, 2, 1, 3)
+            self.output_channels,
+        ).permute(0, 2, 1, 3)  # (B, T_out, N, C)
 
-        last_latent = latent_history[:, -1:, :, :]
-        future_latent = future_latent + last_latent
-        future_latent = future_latent + self.future_time_proj(output_time_emb).unsqueeze(2)
+        # Per-output-step horizon conditioning: embed each output timestamp and
+        # produce a multiplicative gate so each future frame is time-aware.
+        # time_emb: (B, T_total, 2F) — extract the output portion.
+        output_time_emb = time_emb[:, self.num_t_in:, :]  # (B, T_out, 2F)
+        horizon_gate = self.horizon_mlp(output_time_emb)  # (B, T_out, latent_dim)
+        horizon_scale = torch.sigmoid(
+            horizon_gate.mean(dim=-1, keepdim=True)
+        )  # (B, T_out, 1)
+        residual = residual * horizon_scale.unsqueeze(2)  # (B, T_out, N, C)
 
-        residual_frames: list[torch.Tensor] = []
-        for step_idx in range(self.num_t_out):
-            x = future_latent[:, step_idx, :, :]
-            x = self._run_spatial_stack(x, pos, knn_indices, self.forecast_blocks)
-            residual_frames.append(self.decoder(x))
-
-        residual = torch.stack(residual_frames, dim=1)
-        baseline = velocity_in[:, -1:, :, :].expand(-1, self.num_t_out, -1, -1)
+        # Predict residual dynamics around a persistence baseline from the last
+        # input frame.
+        last_input_frame = velocity_in[:, -1:, :, :]
+        baseline = last_input_frame.expand(-1, self.num_t_out, -1, -1)
         velocity_out = baseline + residual
 
+        # Hard no-slip on the final prediction in the correct scaled space.
         airfoil_mask_bool = airfoil_mask.bool().unsqueeze(1).expand(
             -1,
             self.num_t_out,
@@ -371,14 +358,26 @@ class SpatiotemporalMNO(nn.Module):
                 self.output_channels,
             )
             scaled_zero = scaled_zero.to(
-                device=velocity_out.device,
-                dtype=velocity_out.dtype,
+                device=velocity_out.device, dtype=velocity_out.dtype
             )
             velocity_out = torch.where(airfoil_mask_bool, scaled_zero, velocity_out)
         else:
-            velocity_out = velocity_out * (~airfoil_mask_bool).to(dtype=velocity_out.dtype)
+            velocity_out = velocity_out * (~airfoil_mask_bool).to(
+                dtype=velocity_out.dtype
+            )
 
         output = velocity_out.contiguous()
+
+        # Unscale back to physical velocity space when auto-normalization applied.
+        if _auto_normalized:
+            vm = velocity_mean.view(
+                batch_size, 1, 1, self.output_channels
+            ).to(dtype=output.dtype)
+            vs = velocity_std.view(
+                batch_size, 1, 1, self.output_channels
+            ).to(dtype=output.dtype)
+            output = output * vs + vm
+
         if return_knn_indices:
             return output, knn_indices
         return output

@@ -1,48 +1,50 @@
 # Spatiotemporal MNO
 
-This model is an alternative to the baseline `models/mlp/` architecture.
+This is the basic Multiscale Neural Operator submission.
+
+> An earlier GRU-based latent-temporal variant also lived in this folder, but it
+> was **not** used for the submission. The shipped model is the basic MNO
+> documented below, and its trained weights (`state_dict.pt`) are loaded
+> automatically by the constructor.
 
 ## Idea
 
-The baseline flattens the full 5-frame velocity history into one per-point feature vector and lets the MNO stack infer temporal structure implicitly.
-
-`SpatiotemporalMNO` makes that factorisation explicit:
-
-1. Encode each observed frame separately with a shared spatial encoder.
-2. Run shared MNO blocks on each frame to build geometry-aware spatial latents.
-3. Forecast future latent trajectories with a temporal sequence model.
-4. Refine each future latent field with MNO blocks and decode to velocity residuals.
+The full 5-frame velocity history is flattened into one per-point feature
+vector. A shared encoder lifts it to a latent field, a stack of geometry-aware
+MNO blocks mixes it spatially, and a decoder produces velocity residuals for all
+future frames at once around a persistence baseline.
 
 ## Why this matches the challenge
 
-- The airfoil geometry is fixed across the 10 timestamps, so spatial encoding can be shared across all observed frames.
-- The next 5 frames depend on temporal evolution, not just the current spatial field, so an explicit latent temporal model is useful.
-- The output is still a per-point velocity field, so the decoder keeps point alignment and the no-slip boundary constraint from the baseline.
+- The airfoil geometry is fixed across the 10 timestamps, so a single spatial
+  pass over the point cloud captures the relevant structure.
+- The output is a per-point velocity field, so the decoder keeps point alignment
+  and the no-slip boundary constraint.
 
 ## Implementation details
 
 File: `models/spatiotemporal_mno/model.py`
 
-- Inputs per observed frame:
+- Inputs (per point):
   - `pos`
-  - the current velocity frame only
-  - Fourier embedding of the current timestamp
+  - flattened velocity history (all observed frames)
+  - Fourier embedding of every timestamp (input + output)
   - airfoil mask
   - wall distance
   - local surface frame
-- Shared spatial backbone:
-  - frame encoder MLP
-  - MNO blocks over the point cloud
-- Temporal forecaster:
-  - GRU over the sequence of per-point latent states
-  - direct seq2seq latent prediction for all future steps at once
-- Future decoder:
-  - output-time conditioning
-  - MNO refinement blocks on each forecast latent field
-  - pointwise decoder MLP to residual velocity
+- Backbone:
+  - encoder MLP
+  - stack of MNO blocks over the point cloud
+- Decoder:
+  - pointwise decoder MLP to all future residual frames
+  - per-output-step horizon gating from the output-timestamp embedding
 - Physics prior:
   - persistence baseline from the last observed frame
   - hard no-slip enforcement on airfoil points in scaled space
+- Pretrained weights:
+  - `state_dict.pt` ships in this folder and is auto-loaded in the constructor
+    (`load_pretrained=True` by default; pass `load_pretrained=False` to train
+    from scratch).
 
 ## Training workflow
 
