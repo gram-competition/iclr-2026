@@ -4,29 +4,27 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from models import PTPointNet as Model
+from models import MLP as Model
 
 # The model constructor has to be callable without arguments
 model = Model()
-device = next(model.parameters()).device
 
 # Load test split
 t, pos, idcs_airfoil, velocity_in, ground_truth = [], [], [], [], []
-for path in glob("/workspace/data/warped-ifw-test-set/*.npz"):
+for path in glob("warped-ifw-test-split/*.npz"):
     sample = np.load(path)
     t.append(sample["t"])
     pos.append(sample["pos"])
     idcs_airfoil.append(torch.from_numpy(sample["idcs_airfoil"]))
     velocity_in.append(sample["velocity_in"])
     ground_truth.append(sample["velocity_out"])
-t = torch.from_numpy(np.stack(t)).to(device)
-pos = torch.from_numpy(np.stack(pos)).to(device)
-idcs_airfoil = [i.to(device) for i in idcs_airfoil]
-velocity_in = torch.from_numpy(np.stack(velocity_in)).to(device)
-ground_truth = torch.from_numpy(np.stack(ground_truth)).to(device)
+t = torch.from_numpy(np.stack(t))
+pos = torch.from_numpy(np.stack(pos))
+velocity_in = torch.from_numpy(np.stack(velocity_in))
+ground_truth = torch.from_numpy(np.stack(ground_truth))
 
 # Dimensions of the data
-BATCH_SIZE = 95  # indicative per-call batch; held-out test split has 95 samples total
+BATCH_SIZE = 95  # number of point clouds in the test split
 NUM_T_IN = 5  # number of time points in the input
 NUM_T_OUT = 5  # number of time points in the output
 NUM_POS = 100000  # number of points in space
