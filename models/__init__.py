@@ -20,3 +20,4 @@ from .transolver_residual import TransolverResidual
 from .vrt_ensemble import VRTEnsemble
 from .wavelet_latent_operator import WaveletLatentOperator
 from .zonal_moe.wrapper import Model as ZonalMoe
+from .spatiotemporal_mno import SpatiotemporalMNO
