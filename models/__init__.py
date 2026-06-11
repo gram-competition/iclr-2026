@@ -12,6 +12,7 @@ from .kagent import Kagent
 from .levers_tail_submission import LeversTailV2Submission
 from .mlp import MLP
 from .perceiver_flow import PerceiverFlow
+from .pt_pointnet import PTPointNet
 from .smoothsplatnet import SmoothSplatNet
 from .spatiotemporal_mno import SpatiotemporalMNO
 from .submission_model import SubmissionModel
