@@ -194,7 +194,7 @@ class SpatioTemporalGNN(nn.Module):
         hidden_dim: int = 128,
         num_layers: int = 12,
         heads: int = 4,
-        k: int = 12,
+        k: int = 16,
         t_in: int = 5,
         t_out: int = 5,
         use_fourier: bool = True,
