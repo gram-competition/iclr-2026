@@ -102,7 +102,7 @@ def airfoil_boundary_features(
     if idcs_airfoil is None or idcs_airfoil.numel() == 0:
         return pos.new_zeros((n, 4))
 
-    out = pos.new_zeros((n, 4))
+    out = pos.new_zeros((n, 9))
     idcs = idcs_airfoil.long().view(-1).clamp_(0, n - 1)
     surface = pos.index_select(0, idcs).detach()
     surface = _subsample_surface(surface, max_airfoil_samples)
@@ -127,9 +127,11 @@ def airfoil_boundary_features(
     nearest = surface_w[min_idcs]
     disp = pos_w - nearest
     disp = disp / (disp.norm(dim=-1, keepdim=True) + 1e-8)
-    out = torch.cat(
-        (torch.log1p(min_dist).unsqueeze(-1), disp), dim=-1
-    )
+    raw_dist = min_dist.unsqueeze(-1)
+    nearest2 = surface_w[min_idcs]
+    disp_raw = pos_w - nearest2
+    extra = torch.cat([raw_dist, disp_raw, torch.log1p(min_dist).unsqueeze(-1) ** 2], dim=-1)
+    out = torch.cat((torch.log1p(min_dist).unsqueeze(-1), disp, extra), dim=-1)
     return out.to(dtype=dtype)
 
 
