@@ -413,7 +413,7 @@ def train(args: argparse.Namespace) -> None:
             raise FileNotFoundError(
                 f"Resume checkpoint not found: {resume_from_path.resolve()}"
             )
-        resume_payload = torch.load(resume_from_path, map_location=device, weights_only=False)
+        resume_payload = torch.load(resume_from_path, map_location=device, weights_only=True)
         resume_checkpoint = _load_model_state_from_checkpoint(model, resume_payload)
         print(f"Loaded initial weights from checkpoint: {resume_from_path}")
 
@@ -827,7 +827,7 @@ def train(args: argparse.Namespace) -> None:
         else:
             print(f"Run loss plot was skipped: {run_artifacts.plot_error}")
 
-        best_checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        best_checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
         _load_model_state_from_checkpoint(model, best_checkpoint)
         test_loss, test_metric, _ = run_full_test_inference(
             model,

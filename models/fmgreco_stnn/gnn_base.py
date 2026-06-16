@@ -169,9 +169,9 @@ class SpatioTemporalGNN(nn.Module):
         )
         if os.path.isfile(weights):
             try:
-                ck = torch.load(weights, map_location="cpu", weights_only=False)
+                ck = torch.load(weights, map_location="cpu", weights_only=True)
             except TypeError:
-                ck = torch.load(weights, map_location="cpu")
+                ck = torch.load(weights, map_location="cpu", weights_only=True)
             state = ck.get("model_state_dict", ck)
             self.load_state_dict(state, strict=False)
 
