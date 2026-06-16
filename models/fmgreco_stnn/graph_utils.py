@@ -25,6 +25,12 @@ def knn_graph(
         neighbors: (N, k) int64
         rel_pos: (N, k, 3) neighbour - center
         dists: (N, k)
+
+    Note:
+        SciPy ``cKDTree`` runs on CPU: this allocates a float32 CPU copy of ``pos`` per
+        call (and per rank under DDP). For ~100k points that is modest; on 8-GPU nodes,
+        peak host RAM is roughly eight concurrent copies only if all ranks query at
+        once—typically well within server-class memory, but worth monitoring on small VMs.
     """
     n = pos.size(0)
     if k >= n:
@@ -86,7 +92,10 @@ def airfoil_boundary_features(
     Per volume point: [log1p(d), d_hat] where d is Euclidean distance to the
     nearest *sampled* airfoil point, d_hat = (p - p_s) / (||d||+eps) in R^3.
 
-    Returns (N, 4). If there is no airfoil, returns zeros.
+    Returns (N, 4) with the **same dtype as** ``pos`` (internal ``cdist`` uses fp32 when
+    ``pos`` is half/bfloat16, then results are cast back—see ``_promote_compute_dtype``).
+
+    If there is no airfoil, returns zeros.
     """
     n = pos.size(0)
     device, dtype = pos.device, pos.dtype

@@ -7,6 +7,23 @@ import torch.nn as nn
 
 
 class TemporalAttentionHead(nn.Module):
+    """
+    Per-node temporal mixing: each point gets a length-``t_out`` sequence, then a
+    small Transformer encoder runs **along time** (batch = number of nodes).
+
+    This lets future frames attend to each other so predictions stay temporally
+    coherent, while spatial structure is already encoded in ``x`` from the GNN.
+
+    **Attention backend:** ``nn.TransformerEncoderLayer`` uses
+    ``nn.MultiheadAttention``, which on PyTorch 2.x dispatches through
+    ``torch.nn.functional.scaled_dot_product_attention``. The actual kernel
+    (math vs memory-efficient vs vendor-specific fused attention) depends on
+    dtype, head dim, sequence length, and your build — including ROCm wheels
+    that expose an efficient SDPA path. For GRaM-style horizons (``t_out`` is
+    small, e.g. 5), cost is dominated by the **spatial** GNN over ``N`` nodes,
+    not this temporal attention.
+    """
+
     def __init__(
         self,
         hidden_dim: int,
@@ -18,41 +35,37 @@ class TemporalAttentionHead(nn.Module):
     ):
         super().__init__()
         self.t_out = t_out
-        self.td = temporal_dim or hidden_dim
-        self.proj = nn.Linear(hidden_dim, t_out * self.td)
-        self.attn_layers = nn.ModuleList()
-        self.ff_layers = nn.ModuleList()
-        self.norm1 = nn.ModuleList()
-        self.norm2 = nn.ModuleList()
-        for _ in range(num_attn_layers):
-            self.attn_layers.append(
-                nn.MultiheadAttention(
-                    self.td, num_heads, dropout=dropout, batch_first=True
-                )
+        td = int(temporal_dim or hidden_dim)
+        if td % num_heads != 0:
+            raise ValueError(
+                f"temporal_dim ({td}) must be divisible by num_heads ({num_heads})."
             )
-            self.ff_layers.append(
-                nn.Sequential(
-                    nn.Linear(self.td, self.td * 2),
-                    nn.GELU(),
-                    nn.Dropout(dropout),
-                    nn.Linear(self.td * 2, self.td),
-                    nn.Dropout(dropout),
-                )
-            )
-            self.norm1.append(nn.LayerNorm(self.td))
-            self.norm2.append(nn.LayerNorm(self.td))
-        self.time_pe = nn.Parameter(torch.randn(1, t_out, self.td) * 0.02)
+        self.td = td
+        self.in_proj = (
+            nn.Identity()
+            if td == hidden_dim
+            else nn.Linear(hidden_dim, td, bias=True)
+        )
+
+        self.time_query = nn.Parameter(torch.randn(1, t_out, td) * 0.02)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=td,
+            nhead=num_heads,
+            dim_feedforward=td * 2,
+            dropout=dropout,
+            batch_first=True,
+            norm_first=True,
+            activation="gelu",
+        )
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_attn_layers,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (N, hidden_dim) -> (N, t_out, td)"""
-        n = x.size(0)
-        h = self.proj(x).view(n, self.t_out, self.td)
-        h = h + self.time_pe
-        for attn, ff, n1, n2 in zip(
-            self.attn_layers, self.ff_layers, self.norm1, self.norm2
-        ):
-            res = h
-            h2, _ = attn(h, h, h)
-            h = n1(res + h2)
-            h = n2(h + ff(h))
-        return h
+        x = self.in_proj(x)
+        h = x.unsqueeze(1).expand(-1, self.t_out, -1).contiguous()
+        h = h + self.time_query
+        return self.transformer(h)
