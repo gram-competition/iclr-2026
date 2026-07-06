@@ -1,59 +1,25 @@
-"""Single submission model: fmgreco_stnn (SpatioTemporalGNN).
-
-Loss / optim setup lives under ``src/training/pointcloud_losses.py`` (vendored from
-the original MLP training helpers). ``models/`` only contains this operator.
-"""
-
-from __future__ import annotations
-
-from typing import Any
-
-__all__ = [
-    "SpatioTemporalGNN",
-    "CANONICAL_MODEL_REGISTRY",
-    "MODEL_ALIASES",
-    "MODEL_REGISTRY",
-    "get_model_class",
-    "normalise_model_name",
-]
-
+from .ab_upt import ABUPT
+from .aero_chrono_mixer import AeroChronoMixer
+from .airformer import AirFormer
+from .cdf_2grid import CDFDoubleGridNet
+from .delta_graph import DeltaGraph
+from .ensemble_spatiotemporal_models import EnsembleSpatioTemporalModels
+from .finite_graph_v4 import FiniteGraphV4
 from .fmgreco_stnn import SpatioTemporalGNN
-
-CANONICAL_MODEL_REGISTRY: dict[str, type] = {
-    "spatio_temporal_gnn": SpatioTemporalGNN,
-}
-
-MODEL_ALIASES: dict[str, str] = {
-    "stnn": "spatio_temporal_gnn",
-    "fmgreco_stnn": "spatio_temporal_gnn",
-    "fmgreco-stnn": "spatio_temporal_gnn",
-    "mlp": "spatio_temporal_gnn",
-    "gated_egno_mean_res": "spatio_temporal_gnn",
-    "gated_egno": "spatio_temporal_gnn",
-    "gegno": "spatio_temporal_gnn",
-}
-
-MODEL_REGISTRY: dict[str, type] = {
-    **CANONICAL_MODEL_REGISTRY,
-    **{
-        alias: CANONICAL_MODEL_REGISTRY[target]
-        for alias, target in MODEL_ALIASES.items()
-        if target in CANONICAL_MODEL_REGISTRY
-    },
-}
-
-
-def normalise_model_name(model_name: str) -> str:
-    key = model_name.strip().lower().replace("-", "_")
-    return MODEL_ALIASES.get(key, key)
-
-
-def get_model_class(model_name: str) -> type:
-    normalised = normalise_model_name(model_name)
-    if normalised not in CANONICAL_MODEL_REGISTRY:
-        available = ", ".join(sorted(CANONICAL_MODEL_REGISTRY))
-        raise ValueError(
-            f"Unknown model_name={model_name!r} (normalised={normalised!r}). "
-            f"Available: {available}."
-        ) from None
-    return CANONICAL_MODEL_REGISTRY[normalised]
+from .fno_dse_time import FNO_DSE_TIME
+from .gated_egno import GatedEGNOMeanResModel
+from .harshitsinghsnu import ImprovedMLP
+from .kagent import Kagent
+from .levers_tail_submission import LeversTailV2Submission
+from .mlp import MLP
+from .perceiver_flow import PerceiverFlow
+from .pt_pointnet import PTPointNet
+from .smoothsplatnet import SmoothSplatNet
+from .spatiotemporal_mno import SpatiotemporalMNO
+from .submission_model import SubmissionModel
+from .transolver_ar import TransolverAR
+from .transolver_corrector import TransolverCorrector
+from .transolver_residual import TransolverResidual
+from .vrt_ensemble import VRTEnsemble
+from .wavelet_latent_operator import WaveletLatentOperator
+from .zonal_moe.wrapper import Model as ZonalMoe

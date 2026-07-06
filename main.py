@@ -1,118 +1,51 @@
-from __future__ import annotations
+from glob import glob
 
-import os
-import sys
-from typing import Any
+import numpy as np
+import torch
+from tqdm import tqdm
 
-# Training stack and dataset helpers (imported for API re-exports, not for smoke)
-from src.data import (
-    WarpedIFWDataset,
-    build_loader as _build_loader,
-    compute_velocity_standardization as _compute_velocity_standardization,
-    resolve_overfit_file,
-    scale_velocity as _scale_velocity,
-    split_train_val_test,
-    unscale_velocity_batch as _unscale_velocity_batch,
-)
-from src.training import (
-    NUM_POS,
-    NUM_T_IN,
-    NUM_T_OUT,
-    evaluate,
-    hint_metric,
-    parse_args as _parse_args,
-    run_full_test_inference,
-    set_seed as _set_seed,
-)
-from src.training import trainer as _trainer
-from models import SpatioTemporalGNN, get_model_class
+from models import MLP as Model
 
-Model = SpatioTemporalGNN
+# The model constructor has to be callable without arguments
+model = Model()
 
+# Load test split
+t, pos, idcs_airfoil, velocity_in, ground_truth = [], [], [], [], []
+for path in glob("warped-ifw-test-split/*.npz"):
+    sample = np.load(path)
+    t.append(sample["t"])
+    pos.append(sample["pos"])
+    idcs_airfoil.append(torch.from_numpy(sample["idcs_airfoil"]))
+    velocity_in.append(sample["velocity_in"])
+    ground_truth.append(sample["velocity_out"])
+t = torch.from_numpy(np.stack(t))
+pos = torch.from_numpy(np.stack(pos))
+velocity_in = torch.from_numpy(np.stack(velocity_in))
+ground_truth = torch.from_numpy(np.stack(ground_truth))
 
-def set_seed(seed: int) -> None:
-    _set_seed(seed)
+# Dimensions of the data
+BATCH_SIZE = 95  # number of point clouds in the test split
+NUM_T_IN = 5  # number of time points in the input
+NUM_T_OUT = 5  # number of time points in the output
+NUM_POS = 100000  # number of points in space
+assert t.shape == (BATCH_SIZE, NUM_T_IN + NUM_T_OUT)
+assert pos.shape == (BATCH_SIZE, NUM_POS, 3)
+assert len(idcs_airfoil) == BATCH_SIZE
+assert velocity_in.shape == (BATCH_SIZE, NUM_T_IN, NUM_POS, 3)
+assert ground_truth.shape == (BATCH_SIZE, NUM_T_OUT, NUM_POS, 3)
 
+# The model has to return batched estimates
+cake = [slice(piece[0], piece[-1] + 1) for piece in torch.arange(BATCH_SIZE).split(2)]
+velocity_out = []
+for piece in tqdm(cake):
+    inputs = [input_[piece] for input_ in (t, pos, idcs_airfoil, velocity_in)]
+    with torch.no_grad():
+        velocity_out.append(model(*inputs))
+velocity_out = torch.cat(velocity_out)
+assert velocity_out.shape == (BATCH_SIZE, NUM_T_OUT, NUM_POS, 3)
 
-def parse_args(argv: list[str] | None = None):
-    return _parse_args(argv)
-
-
-def train(args: Any) -> None:
-    # Notebook compatibility: if callers rebind `main.Model`, use that class.
-    _trainer.Model = Model
-    _trainer.train(args)
-
-
-def run_smoke() -> None:
-    """Quick `GRAM_MODEL` / registry sanity check (default when no CLI args)."""
-    import torch
-
-    from models.registry import get_model_class, list_models
-
-    # Default aligns with Agrover112 / PR #10 (gated EGNO) submission; override with
-    # GRAM_SMOKE_MODEL=mlp or GRAM_MODEL=...
-    default = os.environ.get("GRAM_SMOKE_MODEL", "spatio_temporal_gnn")
-    which = os.environ.get("GRAM_MODEL", default)
-    try:
-        ModelCls = get_model_class(which)
-    except KeyError:
-        print(
-            f"Warning: unknown GRAM_MODEL={which!r}; falling back to {default!r}. "
-            f"Known: {', '.join(list_models())}"
-        )
-        ModelCls = get_model_class(default)
-    model = ModelCls()
-    model.eval()
-
-    batch_size = 95
-    num_t_in, num_t_out, num_pos = 5, 5, 100000
-
-    t = torch.rand((batch_size, num_t_in + num_t_out))
-    pos = torch.rand((batch_size, num_pos, 3))
-    idcs_airfoil = [
-        torch.randint(num_pos, size=(n,))
-        for n in torch.randint(3142, 24198, size=(batch_size,))
-    ]
-    velocity_in = torch.rand((batch_size, num_t_in, num_pos, 3))
-    ground_truth = torch.rand((batch_size, num_t_out, num_pos, 3))
-
-    velocity_out = model(t, pos, idcs_airfoil, velocity_in)
-    assert velocity_out.shape == (batch_size, num_t_out, num_pos, 3)
-
-    metric = (velocity_out - ground_truth).norm(dim=3).mean(dim=(1, 2))
-    print(
-        f"Model={ModelCls.__name__} (GRAM_MODEL={os.environ.get('GRAM_MODEL', default)!r}) | "
-        f"Metric: {metric.mean():.4f} +- {metric.std():.4f}"
-    )
-
-
-__all__ = [
-    "Model",
-    "SpatioTemporalGNN",
-    "NUM_POS",
-    "NUM_T_IN",
-    "NUM_T_OUT",
-    "WarpedIFWDataset",
-    "_build_loader",
-    "_compute_velocity_standardization",
-    "_scale_velocity",
-    "_unscale_velocity_batch",
-    "evaluate",
-    "get_model_class",
-    "hint_metric",
-    "parse_args",
-    "resolve_overfit_file",
-    "run_full_test_inference",
-    "run_smoke",
-    "set_seed",
-    "split_train_val_test",
-    "train",
-]
-
-
-if __name__ == "__main__":
-    if len(sys.argv) == 1:
-        run_smoke()
-    else:
-        train(parse_args())
+# The final evaluation metric is relative L² error:
+numerator = ((ground_truth - velocity_out) ** 2).sum(dim=(3, 2, 1))
+denominator = (ground_truth**2).sum(dim=(3, 2, 1))
+metric = (numerator / denominator).sqrt()
+print(f"{type(model).__name__}: {metric.mean():.4f} +- {metric.std():.4f}")
