@@ -5,6 +5,7 @@ from .cdf_2grid import CDFDoubleGridNet
 from .delta_graph import DeltaGraph
 from .ensemble_spatiotemporal_models import EnsembleSpatioTemporalModels
 from .finite_graph_v4 import FiniteGraphV4
+from .fmgreco_stnn import SpatioTemporalGNN
 from .fno_dse_time import FNO_DSE_TIME
 from .gated_egno import GatedEGNOMeanResModel
 from .harshitsinghsnu import ImprovedMLP
